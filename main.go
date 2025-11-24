@@ -59,11 +59,13 @@ type Config struct {
 	StreamDir             string          `json:"streamDir"`
 	OpenAIAPIKey          string          `json:"openaiApiKey"`
 	GroupmeBotID          string          `json:"groupmeBotId"`
+	GroupmeWebhookURL     string          `json:"groupmeWebhookUrl"`
+	DiscordWebhookURL     string          `json:"discordWebhookUrl"`
+	GenericWebhookURL     string          `json:"genericWebhookUrl"`
 	WebhookURL            string          `json:"webhookUrl"`
 	ProcessingDelay       int             `json:"processingDelay"`
 	StreamProcessingDelay int             `json:"streamProcessingDelay"`
 	MaxMessageLength      int             `json:"maxMessageLength"`
-	SystemPrompt          string          `json:"systemPrompt"`
 	WebServerPort         string          `json:"webServerPort"`
 	OpenAIModel           string          `json:"openaiModel"`
 	GroupmeMessageSuffix  string          `json:"groupmeMessageSuffix"`
@@ -78,8 +80,6 @@ type StreamMetadata struct {
 	SelectedTag   string
 	NormalizedTag string
 }
-
-const defaultSystemPrompt = `You are a 2025-ready emergency communications transcription assistant built for mission-critical radio traffic. Deliver verbatim, high-confidence transcripts that preserve unit identifiers, call signs, street names, and incident details. Follow current NENA/APCO clarity standards: expand clipped words only when the intent is unmistakable, keep plain language, and avoid invented content or links. Apply punctuation for readability without altering meaning, and prefer concise, line-broken output when multiple transmissions are present.`
 
 var (
 	configFilePath      = "config.json"
@@ -111,11 +111,10 @@ func loadConfig() Config {
 		WatchDir:              "./watched_directory",
 		UploadDir:             "./watched_directory",
 		StreamDir:             "./stream_segments",
-		WebhookURL:            "https://api.groupme.com/v3/bots/post",
+		GroupmeWebhookURL:     "https://api.groupme.com/v3/bots/post",
 		ProcessingDelay:       1,
 		StreamProcessingDelay: 60,
 		MaxMessageLength:      1000,
-		SystemPrompt:          defaultSystemPrompt,
 		WebServerPort:         "8080",
 		OpenAIModel:           "gpt-4.1",
 		GroupmeMessageSuffix:  " - https://calls.sussexcountyalerts.com/",
@@ -134,6 +133,9 @@ func loadConfig() Config {
 		cfg.StreamDir = firstNonEmpty(os.Getenv("STREAM_DIR"), cfg.StreamDir)
 		cfg.OpenAIAPIKey = firstNonEmpty(os.Getenv("OPENAI_API_KEY"), cfg.OpenAIAPIKey)
 		cfg.GroupmeBotID = firstNonEmpty(os.Getenv("GROUPME_BOT_ID"), cfg.GroupmeBotID)
+		cfg.GroupmeWebhookURL = firstNonEmpty(os.Getenv("GROUPME_WEBHOOK_URL"), cfg.GroupmeWebhookURL)
+		cfg.DiscordWebhookURL = firstNonEmpty(os.Getenv("DISCORD_WEBHOOK_URL"), cfg.DiscordWebhookURL)
+		cfg.GenericWebhookURL = firstNonEmpty(os.Getenv("GENERIC_WEBHOOK_URL"), cfg.GenericWebhookURL)
 		cfg.WebhookURL = firstNonEmpty(os.Getenv("WEBHOOK_URL"), cfg.WebhookURL)
 		if val := os.Getenv("PROCESSING_DELAY"); val != "" {
 			if parsed, err := strconv.Atoi(val); err == nil {
@@ -150,15 +152,11 @@ func loadConfig() Config {
 				cfg.MaxMessageLength = parsed
 			}
 		}
-		cfg.SystemPrompt = firstNonEmpty(os.Getenv("SYSTEM_PROMPT"), cfg.SystemPrompt)
 		cfg.WebServerPort = firstNonEmpty(os.Getenv("WEB_SERVER_PORT"), cfg.WebServerPort)
 		cfg.OpenAIModel = firstNonEmpty(os.Getenv("OPENAI_MODEL"), cfg.OpenAIModel)
 		cfg.GroupmeMessageSuffix = firstNonEmpty(os.Getenv("GROUPME_MESSAGE_SUFFIX"), cfg.GroupmeMessageSuffix)
 	}
 
-	if cfg.SystemPrompt == "" {
-		cfg.SystemPrompt = defaultSystemPrompt
-	}
 	if cfg.UploadDir == "" {
 		cfg.UploadDir = cfg.WatchDir
 	}
@@ -171,8 +169,11 @@ func loadConfig() Config {
 	if cfg.WebServerPort == "" {
 		cfg.WebServerPort = "8080"
 	}
+	if cfg.GroupmeWebhookURL == "" {
+		cfg.GroupmeWebhookURL = "https://api.groupme.com/v3/bots/post"
+	}
 	if cfg.WebhookURL == "" {
-		cfg.WebhookURL = "https://api.groupme.com/v3/bots/post"
+		cfg.WebhookURL = cfg.GroupmeWebhookURL
 	}
 	if cfg.OpenAIModel == "" {
 		cfg.OpenAIModel = "gpt-4.1"
@@ -212,7 +213,7 @@ func loadConfig() Config {
 				Name:                   "default",
 				Platform:               "groupme",
 				BotID:                  cfg.GroupmeBotID,
-				WebhookURL:             cfg.WebhookURL,
+				WebhookURL:             firstNonEmpty(cfg.GroupmeWebhookURL, cfg.WebhookURL),
 				MessageSuffix:          cfg.GroupmeMessageSuffix,
 				SendUploadNotification: true,
 				SendTranscription:      true,
@@ -807,74 +808,6 @@ func validateAudioFile(path string) error {
 	return nil
 }
 
-func postProcessTranscription(transcription string) (string, error) {
-	cfg := getConfig()
-
-	if cfg.OpenAIAPIKey == "" {
-		return "", fmt.Errorf("missing OpenAI API key")
-	}
-
-	apiURL := "https://api.openai.com/v1/chat/completions"
-
-	payload := map[string]interface{}{
-		"model": cfg.OpenAIModel,
-		"messages": []map[string]string{
-			{"role": "system", "content": cfg.SystemPrompt},
-			{"role": "user", "content": transcription},
-		},
-		"temperature": 0.0,
-	}
-
-	payloadBytes, err := json.Marshal(payload)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal payload: %w", err)
-	}
-
-	req, err := http.NewRequest("POST", apiURL, bytes.NewReader(payloadBytes))
-	if err != nil {
-		return "", fmt.Errorf("failed to create HTTP request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+cfg.OpenAIAPIKey)
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("failed to send HTTP request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	bodyBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("failed to read response body: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("OpenAI Chat API error: %s", string(bodyBytes))
-	}
-
-	var result struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
-	}
-	if err = json.Unmarshal(bodyBytes, &result); err != nil {
-		return "", fmt.Errorf("failed to parse JSON response: %w", err)
-	}
-
-	if len(result.Choices) == 0 || result.Choices[0].Message.Content == "" {
-		return "", fmt.Errorf("no content in response")
-	}
-
-	correctedTranscription := strings.TrimSpace(result.Choices[0].Message.Content)
-
-	log.Println("Post-processing completed.")
-
-	return correctedTranscription, nil
-}
-
 func dispatchMessage(message string, channel ChannelConfig, cfg Config) {
 	platform := strings.ToLower(strings.TrimSpace(channel.Platform))
 	if platform == "" {
@@ -884,6 +817,8 @@ func dispatchMessage(message string, channel ChannelConfig, cfg Config) {
 	switch platform {
 	case "discord":
 		sendDiscordMessage(message, channel, cfg)
+	case "generic", "webhook":
+		sendGenericWebhookMessage(message, channel, cfg)
 	default:
 		sendGroupMeMessage(message, channel, cfg)
 	}
@@ -907,11 +842,8 @@ func chunkMessage(message string, maxLen int) []string {
 }
 
 func sendGroupMeMessage(message string, channel ChannelConfig, cfg Config) {
-	webhook := channel.WebhookURL
-	if webhook == "" {
-		webhook = cfg.WebhookURL
-	}
-	if webhook == "" || channel.BotID == "" {
+	webhook := firstNonEmpty(channel.WebhookURL, cfg.GroupmeWebhookURL, cfg.WebhookURL)
+	if strings.TrimSpace(webhook) == "" || channel.BotID == "" {
 		log.Println("Missing GroupMe configuration for channel; skipping dispatch.")
 		return
 	}
@@ -956,10 +888,7 @@ func sendGroupMeMessage(message string, channel ChannelConfig, cfg Config) {
 }
 
 func sendDiscordMessage(message string, channel ChannelConfig, cfg Config) {
-	webhook := channel.WebhookURL
-	if webhook == "" {
-		webhook = cfg.WebhookURL
-	}
+	webhook := firstNonEmpty(channel.WebhookURL, cfg.DiscordWebhookURL, cfg.GenericWebhookURL, cfg.WebhookURL)
 	if strings.TrimSpace(webhook) == "" {
 		log.Println("Missing Discord webhook for channel; skipping dispatch.")
 		return
@@ -1000,6 +929,52 @@ func sendDiscordMessage(message string, channel ChannelConfig, cfg Config) {
 			log.Println("Message sent to Discord channel", channel.Name)
 		} else {
 			log.Printf("Failed to send message to Discord: %d - %s\n", resp.StatusCode, string(bodyBytes))
+		}
+	}
+}
+
+func sendGenericWebhookMessage(message string, channel ChannelConfig, cfg Config) {
+	webhook := firstNonEmpty(channel.WebhookURL, cfg.GenericWebhookURL, cfg.WebhookURL)
+	if strings.TrimSpace(webhook) == "" {
+		log.Println("Missing generic webhook for channel; skipping dispatch.")
+		return
+	}
+
+	maxLen := cfg.MaxMessageLength
+	if maxLen <= 0 {
+		maxLen = 1000
+	}
+
+	for _, chunk := range chunkMessage(message, maxLen) {
+		payload := map[string]string{
+			"text": chunk,
+		}
+
+		payloadBytes, err := json.Marshal(payload)
+		if err != nil {
+			log.Println("Error marshaling generic webhook payload:", err)
+			continue
+		}
+
+		req, err := http.NewRequest("POST", webhook, bytes.NewReader(payloadBytes))
+		if err != nil {
+			log.Println("Error creating generic webhook request:", err)
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			log.Println("Error sending generic webhook message:", err)
+			continue
+		}
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			log.Println("Message sent via generic webhook for channel", channel.Name)
+		} else {
+			log.Printf("Failed to send generic webhook: %d - %s\n", resp.StatusCode, string(bodyBytes))
 		}
 	}
 }
@@ -1149,6 +1124,15 @@ func mergeConfig(current, incoming Config) Config {
 	if incoming.GroupmeBotID != "" {
 		current.GroupmeBotID = incoming.GroupmeBotID
 	}
+	if incoming.GroupmeWebhookURL != "" {
+		current.GroupmeWebhookURL = incoming.GroupmeWebhookURL
+	}
+	if incoming.DiscordWebhookURL != "" {
+		current.DiscordWebhookURL = incoming.DiscordWebhookURL
+	}
+	if incoming.GenericWebhookURL != "" {
+		current.GenericWebhookURL = incoming.GenericWebhookURL
+	}
 	if incoming.WebhookURL != "" {
 		current.WebhookURL = incoming.WebhookURL
 	}
@@ -1157,9 +1141,6 @@ func mergeConfig(current, incoming Config) Config {
 	}
 	if incoming.MaxMessageLength > 0 {
 		current.MaxMessageLength = incoming.MaxMessageLength
-	}
-	if incoming.SystemPrompt != "" {
-		current.SystemPrompt = incoming.SystemPrompt
 	}
 	if incoming.WebServerPort != "" {
 		current.WebServerPort = incoming.WebServerPort
