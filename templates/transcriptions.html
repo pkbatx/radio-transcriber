@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Recent Transcriptions</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        h1 { color: #333; }
+        table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+        th, td { border: 1px solid #ccc; padding: 8px; text-align: left; }
+        th { background-color: #f2f2f2; }
+        tr:nth-child(even) { background-color: #f9f9f9; }
+        .timestamp { width: 180px; }
+        .filename { width: 200px; }
+    </style>
+</head>
+<body>
+    <h1>Recent Transcriptions</h1>
+    <table>
+        <tr>
+            <th class="timestamp">Timestamp</th>
+            <th class="filename">File Name</th>
+            <th>Transcription</th>
+        </tr>
+        {{range .}}
+        <tr>
+            <td>{{.Timestamp.Format "2006-01-02 15:04:05"}}</td>
+            <td><a href="https://calls.sussexcountyalerts.com/{{.FileName}}" target="_blank">{{.FileName}}</a></td>
+            <td>{{.CorrectedText}}</td>
+        </tr>
+        {{end}}
+    </table>
+</body>
+</html>

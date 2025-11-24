@@ -1,0 +1,344 @@
+package main
+
+import (
+    "bytes"
+    "encoding/json"
+    "fmt"
+    "io"
+    "log"
+    "mime/multipart"
+    "net/http"
+    "os"
+    "path/filepath"
+    "strconv"
+    "strings"
+    "sync"
+    "time"
+
+    "github.com/fsnotify/fsnotify"
+    "github.com/joho/godotenv"
+)
+
+var (
+    environment       string
+    watchDir          string
+    openaiAPIKey      string
+    groupmeBotID      string
+    webhookURL        string
+    processingDelay   int
+    maxMessageLength  int
+    processedFiles    = make(map[string]bool)
+    processedFilesMux sync.Mutex
+)
+
+func init() {
+    // Load environment variables from .env file
+    err := godotenv.Load()
+    if err != nil {
+        log.Println("Error loading .env file, using environment variables")
+    }
+
+    environment = os.Getenv("ENVIRONMENT")
+    if environment == "" {
+        environment = "dev"
+    }
+
+    watchDir = os.Getenv("WATCH_DIR")
+    if watchDir == "" {
+        watchDir = "./watched_directory"
+    }
+
+    openaiAPIKey = os.Getenv("OPENAI_API_KEY")
+    if openaiAPIKey == "" {
+        log.Fatal("Missing OpenAI API key. Set the OPENAI_API_KEY environment variable.")
+    }
+
+    groupmeBotID = os.Getenv("GROUPME_BOT_ID")
+    if groupmeBotID == "" {
+        log.Fatal("Missing GroupMe Bot ID. Set the GROUPME_BOT_ID environment variable.")
+    }
+
+    webhookURL = os.Getenv("WEBHOOK_URL")
+    if webhookURL == "" {
+        webhookURL = "https://api.groupme.com/v3/bots/post"
+    }
+
+    processingDelayStr := os.Getenv("PROCESSING_DELAY")
+    processingDelay = 1
+    if processingDelayStr != "" {
+        if val, err := strconv.Atoi(processingDelayStr); err == nil {
+            processingDelay = val
+        }
+    }
+
+    maxMessageLengthStr := os.Getenv("MAX_MESSAGE_LENGTH")
+    maxMessageLength = 1000
+    if maxMessageLengthStr != "" {
+        if val, err := strconv.Atoi(maxMessageLengthStr); err == nil {
+            maxMessageLength = val
+        }
+    }
+}
+
+func main() {
+    watchDirectory(watchDir)
+}
+
+func watchDirectory(dir string) {
+    watcher, err := fsnotify.NewWatcher()
+    if err != nil {
+        log.Fatal("Error creating file watcher:", err)
+    }
+    defer watcher.Close()
+
+    done := make(chan bool)
+
+    go func() {
+        for {
+            select {
+            case event, ok := <-watcher.Events:
+                if !ok {
+                    return
+                }
+                if event.Op&fsnotify.Create == fsnotify.Create {
+                    if strings.HasSuffix(strings.ToLower(event.Name), ".mp3") {
+                        handleNewFile(event.Name)
+                    }
+                }
+            case err, ok := <-watcher.Errors:
+                if !ok {
+                    return
+                }
+                log.Println("Watcher error:", err)
+            }
+        }
+    }()
+
+    err = watcher.Add(dir)
+    if err != nil {
+        log.Fatal("Error adding directory to watcher:", err)
+    }
+    log.Println("Started watching directory:", dir)
+    <-done
+}
+
+func handleNewFile(filePath string) {
+    // Deduplication
+    processedFilesMux.Lock()
+    if processedFiles[filePath] {
+        processedFilesMux.Unlock()
+        log.Println("File already processed:", filePath)
+        return
+    }
+    processedFiles[filePath] = true
+    processedFilesMux.Unlock()
+
+    log.Println("New MP3 file detected:", filePath)
+    time.Sleep(time.Duration(processingDelay) * time.Second) // Wait to ensure file is fully written
+
+    fileName := filepath.Base(filePath)
+    transcription, err := transcribeAudio(filePath)
+    if err != nil {
+        log.Println("Error during transcription:", err)
+        transcription = fmt.Sprintf("Transcription error: %v", err)
+    }
+
+    correctedTranscription, err := postProcessTranscription(transcription)
+    if err != nil {
+        log.Println("Error during post-processing:", err)
+        correctedTranscription = transcription // Fallback to original transcription
+    }
+
+    sendToGroupMe(correctedTranscription, fileName)
+}
+
+func transcribeAudio(filePath string) (string, error) {
+    // Prepare the request to OpenAI API
+    apiURL := "https://api.openai.com/v1/audio/transcriptions"
+
+    // Open the MP3 file directly
+    audioFile, err := os.Open(filePath)
+    if err != nil {
+        return "", fmt.Errorf("failed to open audio file: %w", err)
+    }
+    defer audioFile.Close()
+
+    // Create a buffer to hold the multipart form data
+    var requestBody bytes.Buffer
+    writer := multipart.NewWriter(&requestBody)
+
+    // Add the file field
+    part, err := writer.CreateFormFile("file", filepath.Base(filePath))
+    if err != nil {
+        return "", fmt.Errorf("failed to create form file: %w", err)
+    }
+    _, err = io.Copy(part, audioFile)
+    if err != nil {
+        return "", fmt.Errorf("failed to copy audio file: %w", err)
+    }
+
+    // Add other form fields
+    _ = writer.WriteField("model", "whisper-1")
+    _ = writer.WriteField("response_format", "text")
+    _ = writer.WriteField("language", "en")
+
+    // Close the writer to finalize the form data
+    err = writer.Close()
+    if err != nil {
+        return "", fmt.Errorf("failed to close writer: %w", err)
+    }
+
+    // Create the HTTP request
+    req, err := http.NewRequest("POST", apiURL, &requestBody)
+    if err != nil {
+        return "", fmt.Errorf("failed to create HTTP request: %w", err)
+    }
+    req.Header.Set("Authorization", "Bearer "+openaiAPIKey)
+    req.Header.Set("Content-Type", writer.FormDataContentType())
+
+    // Send the request
+    client := &http.Client{}
+    resp, err := client.Do(req)
+    if err != nil {
+        return "", fmt.Errorf("failed to send HTTP request: %w", err)
+    }
+    defer resp.Body.Close()
+
+    // Read the response body
+    bodyBytes, err := io.ReadAll(resp.Body)
+    if err != nil {
+        return "", fmt.Errorf("failed to read response body: %w", err)
+    }
+
+    // Check for non-200 status code
+    if resp.StatusCode != http.StatusOK {
+        return "", fmt.Errorf("OpenAI API error: %s", string(bodyBytes))
+    }
+
+    // The response is plain text
+    transcription := strings.TrimSpace(string(bodyBytes))
+
+    log.Println("Transcription completed for:", filePath)
+
+    return transcription, nil
+}
+
+func postProcessTranscription(transcription string) (string, error) {
+    // Prepare the request to OpenAI Chat Completion API
+    apiURL := "https://api.openai.com/v1/chat/completions"
+
+    // System prompt to provide context
+    systemPrompt := "You are transcribing a radio dispatch recording. Your task is to correct any spelling discrepancies in the transcribed text. Make sure that any important codes, abbreviations, and terminology used in radio communications are spelled correctly. Only add necessary punctuation such as periods, commas, and capitalization, and use only the context provided. However use common knowledge the goal is to make the message accurate but remove any errors by the transcriber so if the information is repeated please present it as a human readable output"
+
+    // Prepare the request payload
+    payload := map[string]interface{}{
+        "model": "gpt-4",
+        "messages": []map[string]string{
+            {"role": "system", "content": systemPrompt},
+            {"role": "user", "content": transcription},
+        },
+        "temperature": 0.0,
+    }
+
+    payloadBytes, err := json.Marshal(payload)
+    if err != nil {
+        return "", fmt.Errorf("failed to marshal payload: %w", err)
+    }
+
+    // Create the HTTP request
+    req, err := http.NewRequest("POST", apiURL, bytes.NewReader(payloadBytes))
+    if err != nil {
+        return "", fmt.Errorf("failed to create HTTP request: %w", err)
+    }
+    req.Header.Set("Authorization", "Bearer "+openaiAPIKey)
+    req.Header.Set("Content-Type", "application/json")
+
+    // Send the request
+    client := &http.Client{}
+    resp, err := client.Do(req)
+    if err != nil {
+        return "", fmt.Errorf("failed to send HTTP request: %w", err)
+    }
+    defer resp.Body.Close()
+
+    // Read the response body
+    bodyBytes, err := io.ReadAll(resp.Body)
+    if err != nil {
+        return "", fmt.Errorf("failed to read response body: %w", err)
+    }
+
+    // Check for non-200 status code
+    if resp.StatusCode != http.StatusOK {
+        return "", fmt.Errorf("OpenAI Chat API error: %s", string(bodyBytes))
+    }
+
+    // Parse the response
+    var result struct {
+        Choices []struct {
+            Message struct {
+                Content string `json:"content"`
+            } `json:"message"`
+        } `json:"choices"`
+    }
+    err = json.Unmarshal(bodyBytes, &result)
+    if err != nil {
+        return "", fmt.Errorf("failed to parse JSON response: %w", err)
+    }
+
+    if len(result.Choices) == 0 || result.Choices[0].Message.Content == "" {
+        return "", fmt.Errorf("no content in response")
+    }
+
+    correctedTranscription := strings.TrimSpace(result.Choices[0].Message.Content)
+
+    log.Println("Post-processing completed.")
+
+    return correctedTranscription, nil
+}
+
+func sendToGroupMe(transcription, fileName string) {
+    messageText := fmt.Sprintf("%s - https://calls.sussexcountyalerts.com/%s", transcription, fileName)
+    numMessages := int(float64(len(messageText)) / float64(maxMessageLength))
+    if len(messageText)%maxMessageLength != 0 {
+        numMessages++
+    }
+
+    for i := 0; i < numMessages; i++ {
+        start := i * maxMessageLength
+        end := start + maxMessageLength
+        if end > len(messageText) {
+            end = len(messageText)
+        }
+        chunk := messageText[start:end]
+        payload := map[string]string{
+            "bot_id": groupmeBotID,
+            "text":   chunk,
+        }
+        payloadBytes, err := json.Marshal(payload)
+        if err != nil {
+            log.Println("Error marshaling payload:", err)
+            continue
+        }
+
+        req, err := http.NewRequest("POST", webhookURL, bytes.NewReader(payloadBytes))
+        if err != nil {
+            log.Println("Error creating request:", err)
+            continue
+        }
+        req.Header.Set("Content-Type", "application/json")
+
+        resp, err := http.DefaultClient.Do(req)
+        if err != nil {
+            log.Println("Error sending message to GroupMe:", err)
+            continue
+        }
+        defer resp.Body.Close()
+
+        if resp.StatusCode == http.StatusAccepted || resp.StatusCode == http.StatusOK {
+            log.Println("Message sent to GroupMe:", chunk)
+        } else {
+            bodyBytes, _ := io.ReadAll(resp.Body)
+            log.Printf("Failed to send message to GroupMe: %d - %s\n", resp.StatusCode, string(bodyBytes))
+        }
+    }
+}

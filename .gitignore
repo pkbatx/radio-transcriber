@@ -1,0 +1,11 @@
+# Env files
+.env
+.env_older
+*.env
+
+# macOS
+.DS_Store
+
+# Python (if any)
+__pycache__/
+*.pyc
