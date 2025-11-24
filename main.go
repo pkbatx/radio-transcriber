@@ -353,6 +353,11 @@ func handleNewFile(filePath string) {
 	log.Println("New MP3 file detected:", filePath)
 	time.Sleep(time.Duration(cfg.ProcessingDelay) * time.Second)
 
+	if err := waitForStableFile(filePath, 5, 500*time.Millisecond); err != nil {
+		log.Printf("Skipping %s: %v", filepath.Base(filePath), err)
+		return
+	}
+
 	fileName := filepath.Base(filePath)
 
 	silent, err := isAudioSilent(filePath)
@@ -534,6 +539,45 @@ func preprocessAudio(inputFilePath string) (string, error) {
 	}
 
 	return outputFilePath, nil
+}
+
+func waitForStableFile(path string, attempts int, delay time.Duration) error {
+	var prevSize int64
+
+	for i := 0; i < attempts; i++ {
+		info, err := os.Stat(path)
+		if err != nil {
+			return fmt.Errorf("unable to stat file: %w", err)
+		}
+
+		size := info.Size()
+		if size == 0 {
+			return fmt.Errorf("file is empty")
+		}
+
+		if size == prevSize && i > 0 {
+			if err := validateAudioFile(path); err != nil {
+				return err
+			}
+
+			return nil
+		}
+
+		prevSize = size
+		time.Sleep(delay)
+	}
+
+	return fmt.Errorf("file did not stabilize after %d attempts", attempts)
+}
+
+func validateAudioFile(path string) error {
+	cmd := exec.Command("ffmpeg", "-v", "error", "-i", path, "-f", "null", "-")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("invalid audio file: %s", strings.TrimSpace(string(output)))
+	}
+
+	return nil
 }
 
 func postProcessTranscription(transcription string) (string, error) {
