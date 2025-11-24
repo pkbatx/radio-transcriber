@@ -36,18 +36,32 @@ type PageData struct {
 	WatchDir       string
 }
 
+type ChannelConfig struct {
+	Name                   string `json:"name"`
+	BotID                  string `json:"botId"`
+	WebhookURL             string `json:"webhookUrl"`
+	MessageSuffix          string `json:"messageSuffix"`
+	SendUploadNotification bool   `json:"sendUploadNotification"`
+	SendTranscription      bool   `json:"sendTranscription"`
+	IncludeAudioLink       bool   `json:"includeAudioLink"`
+}
+
 type Config struct {
-	Environment          string `json:"environment"`
-	WatchDir             string `json:"watchDir"`
-	OpenAIAPIKey         string `json:"openaiApiKey"`
-	GroupmeBotID         string `json:"groupmeBotId"`
-	WebhookURL           string `json:"webhookUrl"`
-	ProcessingDelay      int    `json:"processingDelay"`
-	MaxMessageLength     int    `json:"maxMessageLength"`
-	SystemPrompt         string `json:"systemPrompt"`
-	WebServerPort        string `json:"webServerPort"`
-	OpenAIModel          string `json:"openaiModel"`
-	GroupmeMessageSuffix string `json:"groupmeMessageSuffix"`
+	Environment          string          `json:"environment"`
+	WatchDir             string          `json:"watchDir"`
+	OpenAIAPIKey         string          `json:"openaiApiKey"`
+	GroupmeBotID         string          `json:"groupmeBotId"`
+	WebhookURL           string          `json:"webhookUrl"`
+	ProcessingDelay      int             `json:"processingDelay"`
+	MaxMessageLength     int             `json:"maxMessageLength"`
+	SystemPrompt         string          `json:"systemPrompt"`
+	WebServerPort        string          `json:"webServerPort"`
+	OpenAIModel          string          `json:"openaiModel"`
+	GroupmeMessageSuffix string          `json:"groupmeMessageSuffix"`
+	OpenAITranscription  string          `json:"openaiTranscriptionModel"`
+	Channels             []ChannelConfig `json:"channels"`
+	StreamURL            string          `json:"streamUrl"`
+	StreamSegmentSeconds int             `json:"streamSegmentSeconds"`
 }
 
 const defaultSystemPrompt = `You are a highly specialized transcription assistant for public safety dispatch communications.
@@ -65,6 +79,8 @@ var (
 	maxTranscriptions = 100 // Adjust as needed
 	watcherCancel     context.CancelFunc
 	watcherWG         sync.WaitGroup
+	streamCancel      context.CancelFunc
+	streamWG          sync.WaitGroup
 )
 
 func init() {
@@ -84,6 +100,8 @@ func loadConfig() Config {
 		WebServerPort:        "8080",
 		OpenAIModel:          "gpt-4",
 		GroupmeMessageSuffix: " - https://calls.sussexcountyalerts.com/",
+		OpenAITranscription:  "whisper-1",
+		StreamSegmentSeconds: 60,
 	}
 
 	if data, err := os.ReadFile(configFilePath); err == nil {
@@ -127,6 +145,9 @@ func loadConfig() Config {
 	if cfg.OpenAIModel == "" {
 		cfg.OpenAIModel = "gpt-4"
 	}
+	if cfg.OpenAITranscription == "" {
+		cfg.OpenAITranscription = "whisper-1"
+	}
 	if cfg.GroupmeMessageSuffix == "" {
 		cfg.GroupmeMessageSuffix = " - https://calls.sussexcountyalerts.com/"
 	}
@@ -136,12 +157,29 @@ func loadConfig() Config {
 	if cfg.MaxMessageLength <= 0 {
 		cfg.MaxMessageLength = 1000
 	}
+	if cfg.StreamSegmentSeconds <= 0 {
+		cfg.StreamSegmentSeconds = 60
+	}
 
 	if cfg.OpenAIAPIKey == "" {
 		cfg.OpenAIAPIKey = os.Getenv("OPENAI_API_KEY")
 	}
 	if cfg.GroupmeBotID == "" {
 		cfg.GroupmeBotID = os.Getenv("GROUPME_BOT_ID")
+	}
+
+	if len(cfg.Channels) == 0 && cfg.GroupmeBotID != "" {
+		cfg.Channels = []ChannelConfig{
+			{
+				Name:                   "default",
+				BotID:                  cfg.GroupmeBotID,
+				WebhookURL:             cfg.WebhookURL,
+				MessageSuffix:          cfg.GroupmeMessageSuffix,
+				SendUploadNotification: true,
+				SendTranscription:      true,
+				IncludeAudioLink:       true,
+			},
+		}
 	}
 
 	return cfg
@@ -187,6 +225,47 @@ func startDirectoryWatcher(dir string) error {
 	return nil
 }
 
+func startStreamRecorder(streamURL, outputDir string, segmentSeconds int) error {
+	if streamCancel != nil {
+		streamCancel()
+		streamWG.Wait()
+	}
+
+	if strings.TrimSpace(streamURL) == "" {
+		return nil
+	}
+
+	if segmentSeconds <= 0 {
+		segmentSeconds = 60
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	streamCancel = cancel
+
+	streamWG.Add(1)
+	go func(url string, outDir string, segment int) {
+		defer streamWG.Done()
+		for ctx.Err() == nil {
+			outputPattern := filepath.Join(outDir, "stream-%Y%m%d-%H%M%S.mp3")
+			cmd := exec.CommandContext(ctx, "ffmpeg", "-y", "-i", url, "-c", "copy", "-f", "segment", "-segment_time", strconv.Itoa(segment), "-reset_timestamps", "1", "-write_id3v2", "1", "-strftime", "1", outputPattern)
+			output, err := cmd.CombinedOutput()
+			if err != nil && ctx.Err() == nil {
+				log.Printf("Stream recorder stopped: %v - %s", err, string(output))
+				time.Sleep(3 * time.Second)
+				continue
+			}
+			if ctx.Err() != nil {
+				return
+			}
+			time.Sleep(1 * time.Second)
+		}
+	}(streamURL, outputDir, segmentSeconds)
+
+	log.Printf("Started stream recorder for %s with %ds segments", streamURL, segmentSeconds)
+
+	return nil
+}
+
 func main() {
 	cfg := loadConfig()
 	if err := saveConfig(cfg); err != nil {
@@ -201,6 +280,10 @@ func main() {
 
 	if err := startDirectoryWatcher(cfg.WatchDir); err != nil {
 		log.Fatalf("Error starting directory watcher: %v", err)
+	}
+
+	if err := startStreamRecorder(cfg.StreamURL, cfg.WatchDir, cfg.StreamSegmentSeconds); err != nil {
+		log.Fatalf("Error starting stream recorder: %v", err)
 	}
 
 	tmplPath := filepath.Join("templates", "transcriptions.html")
@@ -269,21 +352,62 @@ func handleNewFile(filePath string) {
 	time.Sleep(time.Duration(cfg.ProcessingDelay) * time.Second)
 
 	fileName := filepath.Base(filePath)
+	notifyUpload(fileName, cfg)
+
 	transcription, err := transcribeAudio(filePath)
 	if err != nil {
 		log.Println("Error during transcription:", err)
 		transcription = fmt.Sprintf("Transcription error: %v", err)
 	}
 
-	correctedTranscription, err := postProcessTranscription(transcription)
-	if err != nil {
-		log.Println("Error during post-processing:", err)
-		correctedTranscription = transcription
+	storeTranscription(fileName, transcription, transcription)
+
+	sendTranscriptionToChannels(transcription, fileName, cfg)
+}
+
+func notifyUpload(fileName string, cfg Config) {
+	for _, channel := range cfg.Channels {
+		if !channel.SendUploadNotification {
+			continue
+		}
+		link := buildAudioLink(cfg, channel, fileName)
+		message := fmt.Sprintf("New call uploaded: %s", fileName)
+		if channel.IncludeAudioLink && link != "" {
+			message = fmt.Sprintf("%s %s", message, link)
+		}
+		sendGroupMeMessage(message, channel, cfg)
+	}
+}
+
+func sendTranscriptionToChannels(transcription, fileName string, cfg Config) {
+	for _, channel := range cfg.Channels {
+		if !channel.SendTranscription {
+			continue
+		}
+		link := ""
+		if channel.IncludeAudioLink {
+			link = buildAudioLink(cfg, channel, fileName)
+		}
+
+		messageText := transcription
+		if link != "" {
+			messageText = fmt.Sprintf("%s %s", transcription, link)
+		}
+
+		sendGroupMeMessage(messageText, channel, cfg)
+	}
+}
+
+func buildAudioLink(cfg Config, channel ChannelConfig, fileName string) string {
+	suffix := strings.TrimSpace(channel.MessageSuffix)
+	if suffix == "" {
+		suffix = strings.TrimSpace(cfg.GroupmeMessageSuffix)
+	}
+	if suffix == "" {
+		return ""
 	}
 
-	storeTranscription(fileName, transcription, correctedTranscription)
-
-	sendToGroupMe(correctedTranscription, fileName)
+	return fmt.Sprintf("%s%s", suffix, fileName)
 }
 
 func transcribeAudio(filePath string) (string, error) {
@@ -318,7 +442,12 @@ func transcribeAudio(filePath string) (string, error) {
 		return "", fmt.Errorf("failed to copy audio file: %w", err)
 	}
 
-	_ = writer.WriteField("model", "whisper-1")
+	model := cfg.OpenAITranscription
+	if model == "" {
+		model = "whisper-1"
+	}
+
+	_ = writer.WriteField("model", model)
 	_ = writer.WriteField("response_format", "text")
 	_ = writer.WriteField("language", "en")
 
@@ -437,29 +566,35 @@ func postProcessTranscription(transcription string) (string, error) {
 	return correctedTranscription, nil
 }
 
-func sendToGroupMe(transcription, fileName string) {
-	cfg := getConfig()
-
-	if cfg.GroupmeBotID == "" {
-		log.Println("Missing GroupMe Bot ID; skipping message dispatch.")
+func sendGroupMeMessage(message string, channel ChannelConfig, cfg Config) {
+	webhook := channel.WebhookURL
+	if webhook == "" {
+		webhook = cfg.WebhookURL
+	}
+	if webhook == "" || channel.BotID == "" {
+		log.Println("Missing GroupMe configuration for channel; skipping dispatch.")
 		return
 	}
 
-	messageText := transcription + cfg.GroupmeMessageSuffix + fileName
-	numMessages := int(float64(len(messageText)) / float64(cfg.MaxMessageLength))
-	if len(messageText)%cfg.MaxMessageLength != 0 {
+	maxLen := cfg.MaxMessageLength
+	if maxLen <= 0 {
+		maxLen = 1000
+	}
+
+	numMessages := int(float64(len(message)) / float64(maxLen))
+	if len(message)%maxLen != 0 {
 		numMessages++
 	}
 
 	for i := 0; i < numMessages; i++ {
-		start := i * cfg.MaxMessageLength
-		end := start + cfg.MaxMessageLength
-		if end > len(messageText) {
-			end = len(messageText)
+		start := i * maxLen
+		end := start + maxLen
+		if end > len(message) {
+			end = len(message)
 		}
-		chunk := messageText[start:end]
+		chunk := message[start:end]
 		payload := map[string]string{
-			"bot_id": cfg.GroupmeBotID,
+			"bot_id": channel.BotID,
 			"text":   chunk,
 		}
 		payloadBytes, err := json.Marshal(payload)
@@ -468,7 +603,7 @@ func sendToGroupMe(transcription, fileName string) {
 			continue
 		}
 
-		req, err := http.NewRequest("POST", cfg.WebhookURL, bytes.NewReader(payloadBytes))
+		req, err := http.NewRequest("POST", webhook, bytes.NewReader(payloadBytes))
 		if err != nil {
 			log.Println("Error creating request:", err)
 			continue
@@ -483,7 +618,7 @@ func sendToGroupMe(transcription, fileName string) {
 		defer resp.Body.Close()
 
 		if resp.StatusCode == http.StatusAccepted || resp.StatusCode == http.StatusOK {
-			log.Println("Message sent to GroupMe:", chunk)
+			log.Println("Message sent to GroupMe channel", channel.Name)
 		} else {
 			bodyBytes, _ := io.ReadAll(resp.Body)
 			log.Printf("Failed to send message to GroupMe: %d - %s\n", resp.StatusCode, string(bodyBytes))
@@ -580,6 +715,13 @@ func configAPIHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		if previous.StreamURL != updated.StreamURL || previous.StreamSegmentSeconds != updated.StreamSegmentSeconds || previous.WatchDir != updated.WatchDir {
+			if err := startStreamRecorder(updated.StreamURL, updated.WatchDir, updated.StreamSegmentSeconds); err != nil {
+				http.Error(w, "Failed to restart stream recorder", http.StatusInternalServerError)
+				return
+			}
+		}
+
 		respondWithJSON(w, updated)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -622,8 +764,20 @@ func mergeConfig(current, incoming Config) Config {
 	if incoming.OpenAIModel != "" {
 		current.OpenAIModel = incoming.OpenAIModel
 	}
+	if incoming.OpenAITranscription != "" {
+		current.OpenAITranscription = incoming.OpenAITranscription
+	}
 	if incoming.GroupmeMessageSuffix != "" {
 		current.GroupmeMessageSuffix = incoming.GroupmeMessageSuffix
+	}
+	if len(incoming.Channels) > 0 {
+		current.Channels = incoming.Channels
+	}
+	if incoming.StreamURL != "" {
+		current.StreamURL = incoming.StreamURL
+	}
+	if incoming.StreamSegmentSeconds > 0 {
+		current.StreamSegmentSeconds = incoming.StreamSegmentSeconds
 	}
 
 	return current
@@ -641,6 +795,9 @@ func validateConfig(cfg Config) error {
 	}
 	if cfg.WebServerPort == "" {
 		return fmt.Errorf("web server port is required")
+	}
+	if strings.TrimSpace(cfg.StreamURL) != "" && cfg.StreamSegmentSeconds <= 0 {
+		return fmt.Errorf("stream segment seconds must be positive when stream URL is set")
 	}
 
 	return nil
