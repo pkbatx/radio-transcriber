@@ -6,6 +6,12 @@
 # macOS
 .DS_Store
 
+# Build artifacts
+transcriber
+*.exe
+*.out
+*.test
+
 # Python (if any)
 __pycache__/
 *.pyc
