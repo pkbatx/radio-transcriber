@@ -284,7 +284,9 @@
                     </div>
                     <div class="field">
                         <label for="openaiTranscriptionModel">Transcription model</label>
-                        <input id="openaiTranscriptionModel" name="openaiTranscriptionModel" placeholder="whisper-1" />
+                        <select id="openaiTranscriptionModel" name="openaiTranscriptionModel"></select>
+                        <input id="openaiTranscriptionModelCustom" name="openaiTranscriptionModelCustom" placeholder="Custom model name" style="margin-top: 6px; display: none;" />
+                        <small style="color: var(--muted); display: block; margin-top: 6px;">Choose an OpenAI Whisper/Whisper-like model or specify a custom model.</small>
                     </div>
                     <div class="field">
                         <label for="systemPrompt">System prompt</label>
@@ -388,11 +390,54 @@
         const statusEl = document.getElementById('config-status');
         const chipWatch = document.getElementById('chip-watch');
         const chipTotal = document.getElementById('chip-total');
+        const transcriptionModelSelect = document.getElementById('openaiTranscriptionModel');
+        const transcriptionModelCustom = document.getElementById('openaiTranscriptionModelCustom');
+        const transcriptionModels = [
+            'gpt-4o-transcribe',
+            'gpt-4o-mini-transcribe',
+            'whisper-1',
+        ];
 
         function setStatus(message, type = '') {
             statusEl.textContent = message;
             statusEl.className = `status ${type}`.trim();
         }
+
+        function populateTranscriptionModels(selectedModel = '') {
+            if (!transcriptionModelSelect) return;
+            transcriptionModelSelect.innerHTML = '';
+
+            transcriptionModels.forEach((model) => {
+                const option = document.createElement('option');
+                option.value = model;
+                option.textContent = model;
+                transcriptionModelSelect.appendChild(option);
+            });
+
+            const customOption = document.createElement('option');
+            customOption.value = '__custom__';
+            customOption.textContent = 'Custom model';
+            transcriptionModelSelect.appendChild(customOption);
+
+            if (selectedModel && !transcriptionModels.includes(selectedModel)) {
+                transcriptionModelSelect.value = '__custom__';
+                transcriptionModelCustom.style.display = '';
+                transcriptionModelCustom.value = selectedModel;
+            } else {
+                transcriptionModelSelect.value = selectedModel || transcriptionModels[0];
+                transcriptionModelCustom.style.display = 'none';
+                transcriptionModelCustom.value = '';
+            }
+        }
+
+        transcriptionModelSelect?.addEventListener('change', (event) => {
+            const value = event.target.value;
+            const isCustom = value === '__custom__';
+            if (transcriptionModelCustom) {
+                transcriptionModelCustom.style.display = isCustom ? '' : 'none';
+                if (!isCustom) transcriptionModelCustom.value = '';
+            }
+        });
 
         async function loadConfig() {
             try {
@@ -400,7 +445,7 @@
                 if (!response.ok) throw new Error('Failed to load configuration');
                 const cfg = await response.json();
 
-                const fields = ['environment', 'watchDir', 'openaiApiKey', 'groupmeBotId', 'webhookUrl', 'processingDelay', 'maxMessageLength', 'systemPrompt', 'webServerPort', 'openaiModel', 'openaiTranscriptionModel', 'groupmeMessageSuffix', 'streamUrl', 'streamSegmentSeconds'];
+                const fields = ['environment', 'watchDir', 'openaiApiKey', 'groupmeBotId', 'webhookUrl', 'processingDelay', 'maxMessageLength', 'systemPrompt', 'webServerPort', 'openaiModel', 'groupmeMessageSuffix', 'streamUrl', 'streamSegmentSeconds'];
                 fields.forEach((field) => {
                     const input = document.getElementById(field);
                     if (!input) return;
@@ -416,6 +461,7 @@
                     channelsInput.value = JSON.stringify(cfg.channels || [], null, 2);
                 }
 
+                populateTranscriptionModels(cfg.openaiTranscriptionModel || '');
                 chipWatch.textContent = `Watching: ${cfg.watchDir}`;
                 setStatus('', '');
             } catch (error) {
@@ -442,6 +488,15 @@
                 }
             }
 
+            const selectedModel = transcriptionModelSelect?.value === '__custom__'
+                ? transcriptionModelCustom.value.trim()
+                : transcriptionModelSelect?.value;
+
+            if (!selectedModel) {
+                setStatus('Please choose a transcription model or enter a custom one.', 'error');
+                return;
+            }
+
             const payload = {
                 environment: document.getElementById('environment').value,
                 watchDir: document.getElementById('watchDir').value,
@@ -453,7 +508,7 @@
                 systemPrompt: document.getElementById('systemPrompt').value,
                 webServerPort: document.getElementById('webServerPort').value,
                 openaiModel: document.getElementById('openaiModel').value,
-                openaiTranscriptionModel: document.getElementById('openaiTranscriptionModel').value,
+                openaiTranscriptionModel: selectedModel,
                 groupmeMessageSuffix: document.getElementById('groupmeMessageSuffix').value,
                 channels,
                 streamUrl: document.getElementById('streamUrl').value,
