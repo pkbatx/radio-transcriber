@@ -13,6 +13,8 @@
             --accent: #63b3ff;
             --border: #1f2b45;
             --success: #4ade80;
+            --warning: #fbbf24;
+            --danger: #f87171;
         }
 
         * { box-sizing: border-box; }
@@ -164,7 +166,7 @@
             color: var(--muted);
         }
 
-        .copy-btn {
+        .copy-btn, .secondary-btn {
             background: rgba(255, 255, 255, 0.04);
             border: 1px solid var(--border);
             color: var(--text);
@@ -183,6 +185,62 @@
             font-size: 12px;
             border: 1px solid rgba(74, 222, 128, 0.35);
         }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+            gap: 16px;
+            margin-bottom: 16px;
+        }
+
+        .form-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+            gap: 12px 16px;
+        }
+
+        .field {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+
+        label {
+            font-size: 13px;
+            color: var(--muted);
+        }
+
+        input, textarea, select {
+            background: rgba(255, 255, 255, 0.02);
+            border: 1px solid var(--border);
+            color: var(--text);
+            padding: 10px 12px;
+            border-radius: 10px;
+            font-size: 14px;
+            width: 100%;
+        }
+
+        textarea {
+            min-height: 120px;
+            resize: vertical;
+        }
+
+        .form-footer {
+            display: flex;
+            justify-content: flex-end;
+            gap: 12px;
+            margin-top: 12px;
+        }
+
+        .status {
+            margin-top: 10px;
+            font-size: 13px;
+            color: var(--muted);
+        }
+
+        .status.success { color: var(--success); }
+        .status.error { color: var(--danger); }
+        .status.note { color: var(--warning); }
     </style>
 </head>
 <body>
@@ -194,49 +252,114 @@
                 <p class="subtitle">Browse the latest corrected transcriptions captured from the watch directory and quickly search, copy, or open the source audio.</p>
             </div>
             <div class="meta">
-                <span class="chip">Watching: {{.WatchDir}}</span>
-                <span class="chip">Entries: {{.Total}}</span>
+                <span class="chip" id="chip-watch">Watching: {{.WatchDir}}</span>
+                <span class="chip" id="chip-total">Entries: {{.Total}}</span>
                 <span class="chip">Updated: {{if .LastUpdated.IsZero}}Pending{{else}}{{.LastUpdated.Format "2006-01-02 15:04:05 MST"}}{{end}}</span>
             </div>
         </div>
 
-        <section class="panel">
-            <div class="controls">
-                <input id="search" class="search" type="search" placeholder="Filter by text, timestamp, or filename..." aria-label="Filter transcriptions">
-                <button class="button" id="refresh">Refresh feed</button>
-            </div>
+        <section class="grid">
+            <section class="panel">
+                <div class="controls">
+                    <h2 style="margin: 0; font-size: 18px;">Configuration</h2>
+                    <span class="chip" title="Changing the port is saved for the next launch">Port applies after restart</span>
+                </div>
 
-            <div class="table-wrapper">
-                <table aria-label="Recent transcriptions">
-                    <thead>
-                        <tr>
-                            <th style="width: 180px;">Timestamp</th>
-                            <th style="width: 220px;">File</th>
-                            <th>Corrected transcription</th>
-                            <th style="width: 110px;">Actions</th>
-                        </tr>
-                    </thead>
-                    <tbody id="table-body">
-                        {{if eq (len .Transcriptions) 0}}
-                        <tr data-empty="true">
-                            <td colspan="4" class="empty-state">No transcriptions yet. New items will appear here as they are processed.</td>
-                        </tr>
-                        {{else}}
-                        {{range .Transcriptions}}
-                        <tr>
-                            <td>{{.Timestamp.Format "2006-01-02 15:04:05"}}</td>
-                            <td class="filename"><a href="https://calls.sussexcountyalerts.com/{{.FileName}}" target="_blank" rel="noopener">{{.FileName}}</a></td>
-                            <td>{{.CorrectedText}}</td>
-                            <td>
-                                <div class="badge">Original: {{.OriginalText}}</div>
-                                <button class="copy-btn" data-text="{{.CorrectedText}}">Copy</button>
-                            </td>
-                        </tr>
-                        {{end}}
-                        {{end}}
-                    </tbody>
-                </table>
-            </div>
+                <form id="config-form" class="form-grid">
+                    <div class="field">
+                        <label for="environment">Environment</label>
+                        <input id="environment" name="environment" placeholder="dev / prod" />
+                    </div>
+                    <div class="field">
+                        <label for="watchDir">Watch directory</label>
+                        <input id="watchDir" name="watchDir" placeholder="./watched_directory" required />
+                    </div>
+                    <div class="field">
+                        <label for="openaiApiKey">OpenAI API key</label>
+                        <input id="openaiApiKey" name="openaiApiKey" type="password" autocomplete="off" placeholder="sk-..." />
+                    </div>
+                    <div class="field">
+                        <label for="openaiModel">OpenAI model</label>
+                        <input id="openaiModel" name="openaiModel" placeholder="gpt-4o" />
+                    </div>
+                    <div class="field">
+                        <label for="systemPrompt">System prompt</label>
+                        <textarea id="systemPrompt" name="systemPrompt"></textarea>
+                    </div>
+                    <div class="field">
+                        <label for="processingDelay">Processing delay (seconds)</label>
+                        <input id="processingDelay" name="processingDelay" type="number" min="0" step="1" />
+                    </div>
+                    <div class="field">
+                        <label for="maxMessageLength">Max message length</label>
+                        <input id="maxMessageLength" name="maxMessageLength" type="number" min="1" step="1" />
+                    </div>
+                    <div class="field">
+                        <label for="groupmeBotId">GroupMe Bot ID</label>
+                        <input id="groupmeBotId" name="groupmeBotId" placeholder="123abc" />
+                    </div>
+                    <div class="field">
+                        <label for="webhookUrl">Webhook URL</label>
+                        <input id="webhookUrl" name="webhookUrl" placeholder="https://api.groupme.com/v3/bots/post" />
+                    </div>
+                    <div class="field">
+                        <label for="groupmeMessageSuffix">Message suffix</label>
+                        <input id="groupmeMessageSuffix" name="groupmeMessageSuffix" placeholder=" - https://example.com" />
+                    </div>
+                    <div class="field">
+                        <label for="webServerPort">Web server port</label>
+                        <input id="webServerPort" name="webServerPort" placeholder="8080" />
+                    </div>
+                    <div class="form-footer" style="grid-column: 1 / -1;">
+                        <button type="button" class="secondary-btn" id="reset-config">Reset form</button>
+                        <button type="submit" class="button">Save configuration</button>
+                    </div>
+                    <div class="status note" id="config-note">Changes apply immediately; port updates take effect after restarting the app.</div>
+                    <div class="status" id="config-status" aria-live="polite"></div>
+                </form>
+            </section>
+
+            <section class="panel">
+                <div class="controls">
+                    <h2 style="margin: 0; font-size: 18px;">Feed controls</h2>
+                </div>
+                <div class="controls">
+                    <input id="search" class="search" type="search" placeholder="Filter by text, timestamp, or filename..." aria-label="Filter transcriptions">
+                    <button class="button" id="refresh" type="button">Refresh feed</button>
+                </div>
+
+                <div class="table-wrapper">
+                    <table aria-label="Recent transcriptions">
+                        <thead>
+                            <tr>
+                                <th style="width: 180px;">Timestamp</th>
+                                <th style="width: 220px;">File</th>
+                                <th>Corrected transcription</th>
+                                <th style="width: 110px;">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="table-body">
+                            {{if eq (len .Transcriptions) 0}}
+                            <tr data-empty="true">
+                                <td colspan="4" class="empty-state">No transcriptions yet. New items will appear here as they are processed.</td>
+                            </tr>
+                            {{else}}
+                            {{range .Transcriptions}}
+                            <tr>
+                                <td>{{.Timestamp.Format "2006-01-02 15:04:05"}}</td>
+                                <td class="filename"><a href="https://calls.sussexcountyalerts.com/{{.FileName}}" target="_blank" rel="noopener">{{.FileName}}</a></td>
+                                <td>{{.CorrectedText}}</td>
+                                <td>
+                                    <div class="badge">Original: {{.OriginalText}}</div>
+                                    <button class="copy-btn" data-text="{{.CorrectedText}}">Copy</button>
+                                </td>
+                            </tr>
+                            {{end}}
+                            {{end}}
+                        </tbody>
+                    </table>
+                </div>
+            </section>
         </section>
     </main>
 
@@ -244,6 +367,82 @@
         const searchInput = document.getElementById('search');
         const tableBody = document.getElementById('table-body');
         const refresh = document.getElementById('refresh');
+        const configForm = document.getElementById('config-form');
+        const statusEl = document.getElementById('config-status');
+        const chipWatch = document.getElementById('chip-watch');
+        const chipTotal = document.getElementById('chip-total');
+
+        function setStatus(message, type = '') {
+            statusEl.textContent = message;
+            statusEl.className = `status ${type}`.trim();
+        }
+
+        async function loadConfig() {
+            try {
+                const response = await fetch('/api/config');
+                if (!response.ok) throw new Error('Failed to load configuration');
+                const cfg = await response.json();
+
+                const fields = ['environment', 'watchDir', 'openaiApiKey', 'groupmeBotId', 'webhookUrl', 'processingDelay', 'maxMessageLength', 'systemPrompt', 'webServerPort', 'openaiModel', 'groupmeMessageSuffix'];
+                fields.forEach((field) => {
+                    const input = document.getElementById(field);
+                    if (!input) return;
+                    if (input.type === 'number') {
+                        input.value = cfg[field] ?? '';
+                    } else {
+                        input.value = cfg[field] || '';
+                    }
+                });
+
+                chipWatch.textContent = `Watching: ${cfg.watchDir}`;
+                setStatus('', '');
+            } catch (error) {
+                setStatus(error.message, 'error');
+            }
+        }
+
+        configForm?.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            setStatus('Saving configuration...', '');
+
+            const payload = {
+                environment: document.getElementById('environment').value,
+                watchDir: document.getElementById('watchDir').value,
+                openaiApiKey: document.getElementById('openaiApiKey').value,
+                groupmeBotId: document.getElementById('groupmeBotId').value,
+                webhookUrl: document.getElementById('webhookUrl').value,
+                processingDelay: Number(document.getElementById('processingDelay').value),
+                maxMessageLength: Number(document.getElementById('maxMessageLength').value),
+                systemPrompt: document.getElementById('systemPrompt').value,
+                webServerPort: document.getElementById('webServerPort').value,
+                openaiModel: document.getElementById('openaiModel').value,
+                groupmeMessageSuffix: document.getElementById('groupmeMessageSuffix').value,
+            };
+
+            try {
+                const response = await fetch('/api/config', {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                });
+
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    throw new Error(errorText || 'Failed to update configuration');
+                }
+
+                const updated = await response.json();
+                chipWatch.textContent = `Watching: ${updated.watchDir}`;
+                setStatus('Configuration saved. Watcher updated.', 'success');
+            } catch (error) {
+                setStatus(error.message, 'error');
+            }
+        });
+
+        document.getElementById('reset-config')?.addEventListener('click', () => {
+            loadConfig();
+            setStatus('Form reset to current configuration', 'note');
+        });
 
         searchInput?.addEventListener('input', () => {
             const term = searchInput.value.toLowerCase();
@@ -270,6 +469,8 @@
                 setTimeout(() => target.textContent = 'Copy', 2000);
             });
         });
+
+        loadConfig();
     </script>
 </body>
 </html>
