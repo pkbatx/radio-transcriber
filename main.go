@@ -28,6 +28,8 @@ type Transcription struct {
 	FileName      string
 	OriginalText  string
 	CorrectedText string
+	Source        string
+	Metadata      StreamMetadata
 }
 
 type PageData struct {
@@ -68,6 +70,12 @@ type Config struct {
 	Channels              []ChannelConfig `json:"channels"`
 	StreamURL             string          `json:"streamUrl"`
 	StreamSegmentSeconds  int             `json:"streamSegmentSeconds"`
+}
+
+type StreamMetadata struct {
+	RawTags       map[string]string
+	SelectedTag   string
+	NormalizedTag string
 }
 
 const defaultSystemPrompt = `You are a 2025-ready emergency communications transcription assistant built for mission-critical radio traffic. Deliver verbatim, high-confidence transcripts that preserve unit identifiers, call signs, street names, and incident details. Follow current NENA/APCO clarity standards: expand clipped words only when the intent is unmistakable, keep plain language, and avoid invented content or links. Apply punctuation for readability without altering meaning, and prefer concise, line-broken output when multiple transmissions are present.`
@@ -431,6 +439,10 @@ func processNewFile(filePath string, delaySeconds int, cfg Config, source string
 	}
 
 	fileName := filepath.Base(filePath)
+	metadata := StreamMetadata{}
+	if source == "stream" {
+		metadata = extractStreamMetadata(filePath)
+	}
 
 	silent, err := isAudioSilent(filePath)
 	if err != nil {
@@ -441,7 +453,7 @@ func processNewFile(filePath string, delaySeconds int, cfg Config, source string
 		return
 	}
 
-	notifyUpload(fileName, cfg)
+	notifyUpload(fileName, cfg, source, metadata)
 
 	transcription, err := transcribeAudio(filePath)
 	if err != nil {
@@ -449,18 +461,18 @@ func processNewFile(filePath string, delaySeconds int, cfg Config, source string
 		transcription = fmt.Sprintf("Transcription error: %v", err)
 	}
 
-	storeTranscription(fileName, transcription, transcription)
+	storeTranscription(fileName, transcription, transcription, source, metadata)
 
-	sendTranscriptionToChannels(transcription, fileName, cfg)
+	sendTranscriptionToChannels(transcription, fileName, cfg, source, metadata)
 }
 
-func notifyUpload(fileName string, cfg Config) {
+func notifyUpload(fileName string, cfg Config, source string, metadata StreamMetadata) {
 	for _, channel := range cfg.Channels {
 		if !channel.SendUploadNotification {
 			continue
 		}
 		link := buildAudioLink(cfg, channel, fileName)
-		message := fmt.Sprintf("New call uploaded: %s", fileName)
+		message := formatMessageWithMetadata(fmt.Sprintf("New call uploaded: %s", fileName), source, metadata)
 		if channel.IncludeAudioLink && link != "" {
 			message = fmt.Sprintf("%s %s", message, link)
 		}
@@ -468,7 +480,7 @@ func notifyUpload(fileName string, cfg Config) {
 	}
 }
 
-func sendTranscriptionToChannels(transcription, fileName string, cfg Config) {
+func sendTranscriptionToChannels(transcription, fileName string, cfg Config, source string, metadata StreamMetadata) {
 	for _, channel := range cfg.Channels {
 		if !channel.SendTranscription {
 			continue
@@ -478,9 +490,9 @@ func sendTranscriptionToChannels(transcription, fileName string, cfg Config) {
 			link = buildAudioLink(cfg, channel, fileName)
 		}
 
-		messageText := transcription
+		messageText := formatMessageWithMetadata(transcription, source, metadata)
 		if link != "" {
-			messageText = fmt.Sprintf("%s %s", transcription, link)
+			messageText = fmt.Sprintf("%s %s", messageText, link)
 		}
 
 		dispatchMessage(messageText, channel, cfg)
@@ -497,6 +509,78 @@ func buildAudioLink(cfg Config, channel ChannelConfig, fileName string) string {
 	}
 
 	return fmt.Sprintf("%s%s", suffix, fileName)
+}
+
+func extractStreamMetadata(filePath string) StreamMetadata {
+	meta := StreamMetadata{RawTags: make(map[string]string)}
+
+	cmd := exec.Command("ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", filePath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Printf("Unable to read stream metadata for %s: %v", filepath.Base(filePath), err)
+		return meta
+	}
+
+	var probe struct {
+		Format struct {
+			Tags map[string]string `json:"tags"`
+		} `json:"format"`
+	}
+
+	if err := json.Unmarshal(output, &probe); err != nil {
+		log.Printf("Unable to parse metadata JSON for %s: %v", filepath.Base(filePath), err)
+		return meta
+	}
+
+	if probe.Format.Tags != nil {
+		meta.RawTags = probe.Format.Tags
+	}
+
+	meta.SelectedTag = firstNonEmpty(
+		probe.Format.Tags["StreamTitle"],
+		probe.Format.Tags["streamtitle"],
+		probe.Format.Tags["title"],
+		probe.Format.Tags["TITLE"],
+		probe.Format.Tags["artist"],
+		probe.Format.Tags["ARTIST"],
+	)
+	meta.SelectedTag = strings.TrimSpace(meta.SelectedTag)
+	meta.NormalizedTag = normalizeTransmissionLabel(meta.SelectedTag)
+
+	return meta
+}
+
+func normalizeTransmissionLabel(label string) string {
+	if label == "" {
+		return ""
+	}
+
+	replacer := strings.NewReplacer("_", " ", "-", " ", "–", " ", "—", " ")
+	cleaned := replacer.Replace(label)
+	cleaned = regexp.MustCompile(`\s+`).ReplaceAllString(cleaned, " ")
+	cleaned = strings.TrimSpace(cleaned)
+
+	if cleaned == "" {
+		return ""
+	}
+
+	return strings.ToUpper(cleaned)
+}
+
+func formatMessageWithMetadata(message, source string, metadata StreamMetadata) string {
+	parts := make([]string, 0, 2)
+	if trimmed := strings.TrimSpace(source); trimmed != "" {
+		parts = append(parts, strings.ToUpper(trimmed))
+	}
+	if metadata.NormalizedTag != "" {
+		parts = append(parts, metadata.NormalizedTag)
+	}
+
+	if len(parts) == 0 {
+		return message
+	}
+
+	return fmt.Sprintf("[%s] %s", strings.Join(parts, " · "), message)
 }
 
 func isAudioSilent(filePath string) (bool, error) {
@@ -854,7 +938,7 @@ func sendDiscordMessage(message string, channel ChannelConfig, cfg Config) {
 	}
 }
 
-func storeTranscription(fileName, originalText, correctedText string) {
+func storeTranscription(fileName, originalText, correctedText, source string, metadata StreamMetadata) {
 	transcriptionsMux.Lock()
 	defer transcriptionsMux.Unlock()
 
@@ -863,6 +947,8 @@ func storeTranscription(fileName, originalText, correctedText string) {
 		FileName:      fileName,
 		OriginalText:  originalText,
 		CorrectedText: correctedText,
+		Source:        strings.ToUpper(strings.TrimSpace(source)),
+		Metadata:      metadata,
 	}
 
 	transcriptions = append(transcriptions, t)
