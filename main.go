@@ -10,6 +10,7 @@ import (
 	"log"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -283,7 +284,12 @@ func startStreamRecorder(streamURL, outputDir string, segmentSeconds int) error 
 		streamWG.Wait()
 	}
 
-	if strings.TrimSpace(streamURL) == "" {
+	normalizedURL, err := normalizeStreamURL(streamURL)
+	if err != nil {
+		return fmt.Errorf("invalid stream URL: %w", err)
+	}
+
+	if strings.TrimSpace(normalizedURL) == "" {
 		return nil
 	}
 
@@ -299,7 +305,8 @@ func startStreamRecorder(streamURL, outputDir string, segmentSeconds int) error 
 		defer streamWG.Done()
 		for ctx.Err() == nil {
 			outputPattern := filepath.Join(outDir, "stream-%Y%m%d-%H%M%S.mp3")
-			cmd := exec.CommandContext(ctx, "ffmpeg", "-y", "-i", url, "-c", "copy", "-f", "segment", "-segment_time", strconv.Itoa(segment), "-reset_timestamps", "1", "-write_id3v2", "1", "-strftime", "1", outputPattern)
+			args := buildStreamRecorderArgs(url, outputPattern, segment)
+			cmd := exec.CommandContext(ctx, "ffmpeg", args...)
 			output, err := cmd.CombinedOutput()
 			if err != nil && ctx.Err() == nil {
 				log.Printf("Stream recorder stopped: %v - %s", err, string(output))
@@ -311,11 +318,70 @@ func startStreamRecorder(streamURL, outputDir string, segmentSeconds int) error 
 			}
 			time.Sleep(1 * time.Second)
 		}
-	}(streamURL, outputDir, segmentSeconds)
+	}(normalizedURL, outputDir, segmentSeconds)
 
-	log.Printf("Started stream recorder for %s with %ds segments", streamURL, segmentSeconds)
+	log.Printf("Started stream recorder for %s with %ds segments", redactCredentials(normalizedURL), segmentSeconds)
 
 	return nil
+}
+
+func buildStreamRecorderArgs(streamURL, outputPattern string, segmentSeconds int) []string {
+	silenceFilter := fmt.Sprintf("silencedetect=noise=%ddB:d=%.2f", -55, 0.6)
+
+	return []string{
+		"-y",
+		"-hide_banner",
+		"-loglevel", "warning",
+		"-reconnect", "1",
+		"-reconnect_streamed", "1",
+		"-reconnect_delay_max", "4",
+		"-i", streamURL,
+		"-af", silenceFilter,
+		"-c:a", "libmp3lame",
+		"-b:a", "128k",
+		"-f", "segment",
+		"-segment_time", strconv.Itoa(segmentSeconds),
+		"-segment_time_delta", "0.5",
+		"-reset_timestamps", "1",
+		"-write_id3v2", "1",
+		"-strftime", "1",
+		"-map", "a",
+		outputPattern,
+	}
+}
+
+func normalizeStreamURL(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", nil
+	}
+
+	parsed, err := url.Parse(trimmed)
+	if err != nil {
+		return "", err
+	}
+
+	if parsed.Scheme == "" {
+		parsed.Scheme = "http"
+	}
+	if strings.EqualFold(parsed.Scheme, "icecast") {
+		parsed.Scheme = "http"
+	}
+
+	return parsed.String(), nil
+}
+
+func redactCredentials(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+
+	if parsed.User != nil {
+		parsed.User = url.User("***")
+	}
+
+	return parsed.String()
 }
 
 func main() {
