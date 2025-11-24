@@ -34,7 +34,8 @@ type PageData struct {
 	Transcriptions []Transcription
 	Total          int
 	LastUpdated    time.Time
-	WatchDir       string
+	UploadDir      string
+	StreamDir      string
 }
 
 type ChannelConfig struct {
@@ -49,39 +50,44 @@ type ChannelConfig struct {
 }
 
 type Config struct {
-	Environment          string          `json:"environment"`
-	WatchDir             string          `json:"watchDir"`
-	OpenAIAPIKey         string          `json:"openaiApiKey"`
-	GroupmeBotID         string          `json:"groupmeBotId"`
-	WebhookURL           string          `json:"webhookUrl"`
-	ProcessingDelay      int             `json:"processingDelay"`
-	MaxMessageLength     int             `json:"maxMessageLength"`
-	SystemPrompt         string          `json:"systemPrompt"`
-	WebServerPort        string          `json:"webServerPort"`
-	OpenAIModel          string          `json:"openaiModel"`
-	GroupmeMessageSuffix string          `json:"groupmeMessageSuffix"`
-	OpenAITranscription  string          `json:"openaiTranscriptionModel"`
-	Channels             []ChannelConfig `json:"channels"`
-	StreamURL            string          `json:"streamUrl"`
-	StreamSegmentSeconds int             `json:"streamSegmentSeconds"`
+	Environment           string          `json:"environment"`
+	WatchDir              string          `json:"watchDir"`
+	UploadDir             string          `json:"uploadDir"`
+	StreamDir             string          `json:"streamDir"`
+	OpenAIAPIKey          string          `json:"openaiApiKey"`
+	GroupmeBotID          string          `json:"groupmeBotId"`
+	WebhookURL            string          `json:"webhookUrl"`
+	ProcessingDelay       int             `json:"processingDelay"`
+	StreamProcessingDelay int             `json:"streamProcessingDelay"`
+	MaxMessageLength      int             `json:"maxMessageLength"`
+	SystemPrompt          string          `json:"systemPrompt"`
+	WebServerPort         string          `json:"webServerPort"`
+	OpenAIModel           string          `json:"openaiModel"`
+	GroupmeMessageSuffix  string          `json:"groupmeMessageSuffix"`
+	OpenAITranscription   string          `json:"openaiTranscriptionModel"`
+	Channels              []ChannelConfig `json:"channels"`
+	StreamURL             string          `json:"streamUrl"`
+	StreamSegmentSeconds  int             `json:"streamSegmentSeconds"`
 }
 
 const defaultSystemPrompt = `You are a 2025-ready emergency communications transcription assistant built for mission-critical radio traffic. Deliver verbatim, high-confidence transcripts that preserve unit identifiers, call signs, street names, and incident details. Follow current NENA/APCO clarity standards: expand clipped words only when the intent is unmistakable, keep plain language, and avoid invented content or links. Apply punctuation for readability without altering meaning, and prefer concise, line-broken output when multiple transmissions are present.`
 
 var (
-	configFilePath    = "config.json"
-	config            Config
-	configMux         sync.RWMutex
-	processedFiles    = make(map[string]bool)
-	processedFilesMux sync.Mutex
-	tmpl              *template.Template
-	transcriptions    []Transcription
-	transcriptionsMux sync.Mutex
-	maxTranscriptions = 100 // Adjust as needed
-	watcherCancel     context.CancelFunc
-	watcherWG         sync.WaitGroup
-	streamCancel      context.CancelFunc
-	streamWG          sync.WaitGroup
+	configFilePath      = "config.json"
+	config              Config
+	configMux           sync.RWMutex
+	processedFiles      = make(map[string]bool)
+	processedFilesMux   sync.Mutex
+	tmpl                *template.Template
+	transcriptions      []Transcription
+	transcriptionsMux   sync.Mutex
+	maxTranscriptions   = 100 // Adjust as needed
+	uploadWatcherCancel context.CancelFunc
+	uploadWatcherWG     sync.WaitGroup
+	streamWatcherCancel context.CancelFunc
+	streamWatcherWG     sync.WaitGroup
+	streamCancel        context.CancelFunc
+	streamWG            sync.WaitGroup
 )
 
 func init() {
@@ -92,17 +98,20 @@ func init() {
 
 func loadConfig() Config {
 	cfg := Config{
-		Environment:          "dev",
-		WatchDir:             "./watched_directory",
-		WebhookURL:           "https://api.groupme.com/v3/bots/post",
-		ProcessingDelay:      1,
-		MaxMessageLength:     1000,
-		SystemPrompt:         defaultSystemPrompt,
-		WebServerPort:        "8080",
-		OpenAIModel:          "gpt-4.1",
-		GroupmeMessageSuffix: " - https://calls.sussexcountyalerts.com/",
-		OpenAITranscription:  "gpt-4o-mini-transcribe",
-		StreamSegmentSeconds: 60,
+		Environment:           "dev",
+		WatchDir:              "./watched_directory",
+		UploadDir:             "./watched_directory",
+		StreamDir:             "./stream_segments",
+		WebhookURL:            "https://api.groupme.com/v3/bots/post",
+		ProcessingDelay:       1,
+		StreamProcessingDelay: 60,
+		MaxMessageLength:      1000,
+		SystemPrompt:          defaultSystemPrompt,
+		WebServerPort:         "8080",
+		OpenAIModel:           "gpt-4.1",
+		GroupmeMessageSuffix:  " - https://calls.sussexcountyalerts.com/",
+		OpenAITranscription:   "gpt-4o-mini-transcribe",
+		StreamSegmentSeconds:  60,
 	}
 
 	if data, err := os.ReadFile(configFilePath); err == nil {
@@ -112,12 +121,19 @@ func loadConfig() Config {
 	} else {
 		cfg.Environment = firstNonEmpty(os.Getenv("ENVIRONMENT"), cfg.Environment)
 		cfg.WatchDir = firstNonEmpty(os.Getenv("WATCH_DIR"), cfg.WatchDir)
+		cfg.UploadDir = firstNonEmpty(os.Getenv("UPLOAD_DIR"), cfg.UploadDir)
+		cfg.StreamDir = firstNonEmpty(os.Getenv("STREAM_DIR"), cfg.StreamDir)
 		cfg.OpenAIAPIKey = firstNonEmpty(os.Getenv("OPENAI_API_KEY"), cfg.OpenAIAPIKey)
 		cfg.GroupmeBotID = firstNonEmpty(os.Getenv("GROUPME_BOT_ID"), cfg.GroupmeBotID)
 		cfg.WebhookURL = firstNonEmpty(os.Getenv("WEBHOOK_URL"), cfg.WebhookURL)
 		if val := os.Getenv("PROCESSING_DELAY"); val != "" {
 			if parsed, err := strconv.Atoi(val); err == nil {
 				cfg.ProcessingDelay = parsed
+			}
+		}
+		if val := os.Getenv("STREAM_PROCESSING_DELAY"); val != "" {
+			if parsed, err := strconv.Atoi(val); err == nil {
+				cfg.StreamProcessingDelay = parsed
 			}
 		}
 		if val := os.Getenv("MAX_MESSAGE_LENGTH"); val != "" {
@@ -134,8 +150,14 @@ func loadConfig() Config {
 	if cfg.SystemPrompt == "" {
 		cfg.SystemPrompt = defaultSystemPrompt
 	}
+	if cfg.UploadDir == "" {
+		cfg.UploadDir = cfg.WatchDir
+	}
+	if cfg.UploadDir == "" {
+		cfg.UploadDir = "./watched_directory"
+	}
 	if cfg.WatchDir == "" {
-		cfg.WatchDir = "./watched_directory"
+		cfg.WatchDir = cfg.UploadDir
 	}
 	if cfg.WebServerPort == "" {
 		cfg.WebServerPort = "8080"
@@ -155,11 +177,17 @@ func loadConfig() Config {
 	if cfg.ProcessingDelay <= 0 {
 		cfg.ProcessingDelay = 1
 	}
+	if cfg.StreamProcessingDelay <= 0 {
+		cfg.StreamProcessingDelay = 60
+	}
 	if cfg.MaxMessageLength <= 0 {
 		cfg.MaxMessageLength = 1000
 	}
 	if cfg.StreamSegmentSeconds <= 0 {
 		cfg.StreamSegmentSeconds = 60
+	}
+	if cfg.StreamDir == "" {
+		cfg.StreamDir = filepath.Join(cfg.UploadDir, "stream_segments")
 	}
 
 	if cfg.OpenAIAPIKey == "" {
@@ -207,19 +235,33 @@ func getConfig() Config {
 	return config
 }
 
-func startDirectoryWatcher(dir string) error {
-	if watcherCancel != nil {
-		watcherCancel()
-		watcherWG.Wait()
+func startUploadWatcher(dir string) error {
+	return startDirectoryWatcher(dir, &uploadWatcherCancel, &uploadWatcherWG, handleUploadFile)
+}
+
+func startStreamWatcher(dir string) error {
+	return startDirectoryWatcher(dir, &streamWatcherCancel, &streamWatcherWG, handleStreamFile)
+}
+
+func startDirectoryWatcher(dir string, cancelRef *context.CancelFunc, wg *sync.WaitGroup, handler func(string)) error {
+	if cancelRef != nil && *cancelRef != nil {
+		(*cancelRef)()
+		wg.Wait()
+	}
+
+	if strings.TrimSpace(dir) == "" {
+		return fmt.Errorf("watch directory is required")
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	watcherCancel = cancel
+	if cancelRef != nil {
+		*cancelRef = cancel
+	}
 
-	watcherWG.Add(1)
+	wg.Add(1)
 	go func(path string) {
-		defer watcherWG.Done()
-		if err := watchDirectory(ctx, path); err != nil {
+		defer wg.Done()
+		if err := watchDirectory(ctx, path, handler); err != nil {
 			log.Println("Directory watcher stopped:", err)
 		}
 	}(dir)
@@ -276,15 +318,25 @@ func main() {
 
 	setConfig(cfg)
 
-	if err := os.MkdirAll(cfg.WatchDir, 0o755); err != nil {
-		log.Fatalf("Error creating watch directory: %v", err)
+	if err := os.MkdirAll(cfg.UploadDir, 0o755); err != nil {
+		log.Fatalf("Error creating upload watch directory: %v", err)
 	}
 
-	if err := startDirectoryWatcher(cfg.WatchDir); err != nil {
-		log.Fatalf("Error starting directory watcher: %v", err)
+	if err := os.MkdirAll(cfg.StreamDir, 0o755); err != nil {
+		log.Fatalf("Error creating stream watch directory: %v", err)
 	}
 
-	if err := startStreamRecorder(cfg.StreamURL, cfg.WatchDir, cfg.StreamSegmentSeconds); err != nil {
+	if err := startUploadWatcher(cfg.UploadDir); err != nil {
+		log.Fatalf("Error starting upload directory watcher: %v", err)
+	}
+
+	if filepath.Clean(cfg.StreamDir) != filepath.Clean(cfg.UploadDir) {
+		if err := startStreamWatcher(cfg.StreamDir); err != nil {
+			log.Fatalf("Error starting stream directory watcher: %v", err)
+		}
+	}
+
+	if err := startStreamRecorder(cfg.StreamURL, cfg.StreamDir, cfg.StreamSegmentSeconds); err != nil {
 		log.Fatalf("Error starting stream recorder: %v", err)
 	}
 
@@ -298,7 +350,7 @@ func main() {
 	startWebServer(cfg.WebServerPort)
 }
 
-func watchDirectory(ctx context.Context, dir string) error {
+func watchDirectory(ctx context.Context, dir string, handler func(string)) error {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return fmt.Errorf("error creating file watcher: %w", err)
@@ -314,7 +366,7 @@ func watchDirectory(ctx context.Context, dir string) error {
 				}
 				if event.Op&fsnotify.Create == fsnotify.Create {
 					if strings.HasSuffix(strings.ToLower(event.Name), ".mp3") {
-						handleNewFile(event.Name)
+						handler(event.Name)
 					}
 				}
 			case err, ok := <-watcher.Errors:
@@ -338,9 +390,27 @@ func watchDirectory(ctx context.Context, dir string) error {
 	return nil
 }
 
-func handleNewFile(filePath string) {
+func handleUploadFile(filePath string) {
 	cfg := getConfig()
+	delay := cfg.ProcessingDelay
+	if delay < 0 {
+		delay = 0
+	}
 
+	processNewFile(filePath, delay, cfg, "upload")
+}
+
+func handleStreamFile(filePath string) {
+	cfg := getConfig()
+	delay := cfg.StreamProcessingDelay
+	if delay <= 0 {
+		delay = 60
+	}
+
+	processNewFile(filePath, delay, cfg, "stream")
+}
+
+func processNewFile(filePath string, delaySeconds int, cfg Config, source string) {
 	processedFilesMux.Lock()
 	if processedFiles[filePath] {
 		processedFilesMux.Unlock()
@@ -350,8 +420,10 @@ func handleNewFile(filePath string) {
 	processedFiles[filePath] = true
 	processedFilesMux.Unlock()
 
-	log.Println("New MP3 file detected:", filePath)
-	time.Sleep(time.Duration(cfg.ProcessingDelay) * time.Second)
+	log.Printf("[%s] New MP3 file detected: %s", source, filePath)
+	if delaySeconds > 0 {
+		time.Sleep(time.Duration(delaySeconds) * time.Second)
+	}
 
 	if err := waitForStableFile(filePath, 5, 500*time.Millisecond); err != nil {
 		log.Printf("Skipping %s: %v", filepath.Base(filePath), err)
@@ -826,7 +898,8 @@ func transcriptionsHandler(w http.ResponseWriter, r *http.Request) {
 		Transcriptions: transcriptions,
 		Total:          len(transcriptions),
 		LastUpdated:    lastUpdated,
-		WatchDir:       cfg.WatchDir,
+		UploadDir:      cfg.UploadDir,
+		StreamDir:      cfg.StreamDir,
 	}
 
 	if err := tmpl.Execute(w, data); err != nil {
@@ -860,19 +933,30 @@ func configAPIHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if previous.WatchDir != updated.WatchDir {
-			if err := os.MkdirAll(updated.WatchDir, 0o755); err != nil {
-				http.Error(w, "Failed to prepare watch directory", http.StatusInternalServerError)
+		if previous.UploadDir != updated.UploadDir || previous.WatchDir != updated.WatchDir {
+			if err := os.MkdirAll(updated.UploadDir, 0o755); err != nil {
+				http.Error(w, "Failed to prepare upload directory", http.StatusInternalServerError)
 				return
 			}
-			if err := startDirectoryWatcher(updated.WatchDir); err != nil {
-				http.Error(w, "Failed to restart directory watcher", http.StatusInternalServerError)
+			if err := startUploadWatcher(updated.UploadDir); err != nil {
+				http.Error(w, "Failed to restart upload watcher", http.StatusInternalServerError)
 				return
 			}
 		}
 
-		if previous.StreamURL != updated.StreamURL || previous.StreamSegmentSeconds != updated.StreamSegmentSeconds || previous.WatchDir != updated.WatchDir {
-			if err := startStreamRecorder(updated.StreamURL, updated.WatchDir, updated.StreamSegmentSeconds); err != nil {
+		if previous.StreamDir != updated.StreamDir {
+			if err := os.MkdirAll(updated.StreamDir, 0o755); err != nil {
+				http.Error(w, "Failed to prepare stream directory", http.StatusInternalServerError)
+				return
+			}
+			if err := startStreamWatcher(updated.StreamDir); err != nil {
+				http.Error(w, "Failed to restart stream watcher", http.StatusInternalServerError)
+				return
+			}
+		}
+
+		if previous.StreamURL != updated.StreamURL || previous.StreamSegmentSeconds != updated.StreamSegmentSeconds || previous.StreamDir != updated.StreamDir {
+			if err := startStreamRecorder(updated.StreamURL, updated.StreamDir, updated.StreamSegmentSeconds); err != nil {
 				http.Error(w, "Failed to restart stream recorder", http.StatusInternalServerError)
 				return
 			}
@@ -895,6 +979,17 @@ func mergeConfig(current, incoming Config) Config {
 	}
 	if incoming.WatchDir != "" {
 		current.WatchDir = incoming.WatchDir
+		current.UploadDir = incoming.WatchDir
+	}
+	if incoming.UploadDir != "" {
+		current.UploadDir = incoming.UploadDir
+		current.WatchDir = incoming.UploadDir
+	}
+	if current.UploadDir == "" {
+		current.UploadDir = current.WatchDir
+	}
+	if current.WatchDir == "" {
+		current.WatchDir = current.UploadDir
 	}
 	if incoming.OpenAIAPIKey != "" {
 		current.OpenAIAPIKey = incoming.OpenAIAPIKey
@@ -935,16 +1030,39 @@ func mergeConfig(current, incoming Config) Config {
 	if incoming.StreamSegmentSeconds > 0 {
 		current.StreamSegmentSeconds = incoming.StreamSegmentSeconds
 	}
+	if incoming.StreamDir != "" {
+		current.StreamDir = incoming.StreamDir
+	}
+	if incoming.StreamProcessingDelay > 0 {
+		current.StreamProcessingDelay = incoming.StreamProcessingDelay
+	}
+	if current.StreamProcessingDelay <= 0 {
+		current.StreamProcessingDelay = 60
+	}
+	if current.StreamDir == "" {
+		current.StreamDir = filepath.Join(current.UploadDir, "stream_segments")
+	}
 
 	return current
 }
 
 func validateConfig(cfg Config) error {
-	if cfg.WatchDir == "" {
-		return fmt.Errorf("watch directory is required")
+	uploadDir := cfg.UploadDir
+	if uploadDir == "" {
+		uploadDir = cfg.WatchDir
+	}
+	if uploadDir == "" {
+		return fmt.Errorf("upload directory is required")
+	}
+	streamDir := cfg.StreamDir
+	if streamDir == "" {
+		streamDir = filepath.Join(uploadDir, "stream_segments")
 	}
 	if cfg.ProcessingDelay < 0 {
 		return fmt.Errorf("processing delay cannot be negative")
+	}
+	if cfg.StreamProcessingDelay < 0 {
+		return fmt.Errorf("stream processing delay cannot be negative")
 	}
 	if cfg.MaxMessageLength <= 0 {
 		return fmt.Errorf("max message length must be positive")
@@ -954,6 +1072,9 @@ func validateConfig(cfg Config) error {
 	}
 	if strings.TrimSpace(cfg.StreamURL) != "" && cfg.StreamSegmentSeconds <= 0 {
 		return fmt.Errorf("stream segment seconds must be positive when stream URL is set")
+	}
+	if filepath.Clean(uploadDir) == filepath.Clean(streamDir) {
+		return fmt.Errorf("stream directory must be different from upload directory")
 	}
 
 	return nil

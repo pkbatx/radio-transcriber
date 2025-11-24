@@ -249,10 +249,11 @@
             <div>
                 <p class="pill">Live monitoring</p>
                 <h1 class="title">Radio Transcriber</h1>
-                <p class="subtitle">Browse the latest corrected transcriptions captured from the watch directory and quickly search, copy, or open the source audio.</p>
+                <p class="subtitle">Browse the latest corrected transcriptions captured from upload drops and live stream recordings, then quickly search, copy, or open the source audio.</p>
             </div>
             <div class="meta">
-                <span class="chip" id="chip-watch">Watching: {{.WatchDir}}</span>
+                <span class="chip" id="chip-upload">Uploads: {{.UploadDir}}</span>
+                <span class="chip" id="chip-stream">Stream: {{.StreamDir}}</span>
                 <span class="chip" id="chip-total">Entries: {{.Total}}</span>
                 <span class="chip">Updated: {{if .LastUpdated.IsZero}}Pending{{else}}{{.LastUpdated.Format "2006-01-02 15:04:05 MST"}}{{end}}</span>
             </div>
@@ -271,8 +272,12 @@
                         <input id="environment" name="environment" placeholder="dev / prod" />
                     </div>
                     <div class="field">
-                        <label for="watchDir">Watch directory</label>
-                        <input id="watchDir" name="watchDir" placeholder="./watched_directory" required />
+                        <label for="uploadDir">Upload watch directory</label>
+                        <input id="uploadDir" name="uploadDir" placeholder="./watched_directory" required />
+                    </div>
+                    <div class="field">
+                        <label for="streamDir">Stream watch directory</label>
+                        <input id="streamDir" name="streamDir" placeholder="./stream_segments" required />
                     </div>
                     <div class="field">
                         <label for="openaiApiKey">OpenAI API key</label>
@@ -295,6 +300,11 @@
                     <div class="field">
                         <label for="processingDelay">Processing delay (seconds)</label>
                         <input id="processingDelay" name="processingDelay" type="number" min="0" step="1" />
+                    </div>
+                    <div class="field">
+                        <label for="streamProcessingDelay">Stream processing delay (seconds)</label>
+                        <input id="streamProcessingDelay" name="streamProcessingDelay" type="number" min="0" step="1" />
+                        <small style="color: var(--muted); display: block; margin-top: 6px;">Wait time before processing stream segments so recordings finish writing.</small>
                     </div>
                     <div class="field">
                         <label for="maxMessageLength">Max message length</label>
@@ -388,7 +398,8 @@
         const refresh = document.getElementById('refresh');
         const configForm = document.getElementById('config-form');
         const statusEl = document.getElementById('config-status');
-        const chipWatch = document.getElementById('chip-watch');
+        const chipUpload = document.getElementById('chip-upload');
+        const chipStream = document.getElementById('chip-stream');
         const chipTotal = document.getElementById('chip-total');
         const transcriptionModelSelect = document.getElementById('openaiTranscriptionModel');
         const transcriptionModelCustom = document.getElementById('openaiTranscriptionModelCustom');
@@ -445,10 +456,10 @@
                 if (!response.ok) throw new Error('Failed to load configuration');
                 const cfg = await response.json();
 
-                const fields = ['environment', 'watchDir', 'openaiApiKey', 'groupmeBotId', 'webhookUrl', 'processingDelay', 'maxMessageLength', 'systemPrompt', 'webServerPort', 'openaiModel', 'groupmeMessageSuffix', 'streamUrl', 'streamSegmentSeconds'];
+                const fields = ['environment', 'uploadDir', 'streamDir', 'openaiApiKey', 'groupmeBotId', 'webhookUrl', 'processingDelay', 'streamProcessingDelay', 'maxMessageLength', 'systemPrompt', 'webServerPort', 'openaiModel', 'groupmeMessageSuffix', 'streamUrl', 'streamSegmentSeconds'];
                 fields.forEach((field) => {
-                    const input = document.getElementById(field);
-                    if (!input) return;
+                        const input = document.getElementById(field);
+                        if (!input) return;
                     if (input.type === 'number') {
                         input.value = cfg[field] ?? '';
                     } else {
@@ -462,7 +473,8 @@
                 }
 
                 populateTranscriptionModels(cfg.openaiTranscriptionModel || '');
-                chipWatch.textContent = `Watching: ${cfg.watchDir}`;
+                if (chipUpload) chipUpload.textContent = `Uploads: ${cfg.uploadDir || cfg.watchDir}`;
+                if (chipStream) chipStream.textContent = `Stream: ${cfg.streamDir}`;
                 setStatus('', '');
             } catch (error) {
                 setStatus(error.message, 'error');
@@ -499,11 +511,13 @@
 
             const payload = {
                 environment: document.getElementById('environment').value,
-                watchDir: document.getElementById('watchDir').value,
+                uploadDir: document.getElementById('uploadDir').value,
+                streamDir: document.getElementById('streamDir').value,
                 openaiApiKey: document.getElementById('openaiApiKey').value,
                 groupmeBotId: document.getElementById('groupmeBotId').value,
                 webhookUrl: document.getElementById('webhookUrl').value,
                 processingDelay: Number(document.getElementById('processingDelay').value),
+                streamProcessingDelay: Number(document.getElementById('streamProcessingDelay').value),
                 maxMessageLength: Number(document.getElementById('maxMessageLength').value),
                 systemPrompt: document.getElementById('systemPrompt').value,
                 webServerPort: document.getElementById('webServerPort').value,
@@ -528,8 +542,9 @@
                 }
 
                 const updated = await response.json();
-                chipWatch.textContent = `Watching: ${updated.watchDir}`;
-                setStatus('Configuration saved. Watcher updated.', 'success');
+                if (chipUpload) chipUpload.textContent = `Uploads: ${updated.uploadDir || updated.watchDir}`;
+                if (chipStream) chipStream.textContent = `Stream: ${updated.streamDir}`;
+                setStatus('Configuration saved. Watchers updated.', 'success');
             } catch (error) {
                 setStatus(error.message, 'error');
             }
