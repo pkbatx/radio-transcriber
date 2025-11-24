@@ -283,6 +283,10 @@
                         <input id="openaiModel" name="openaiModel" placeholder="gpt-4o" />
                     </div>
                     <div class="field">
+                        <label for="openaiTranscriptionModel">Transcription model</label>
+                        <input id="openaiTranscriptionModel" name="openaiTranscriptionModel" placeholder="whisper-1" />
+                    </div>
+                    <div class="field">
                         <label for="systemPrompt">System prompt</label>
                         <textarea id="systemPrompt" name="systemPrompt"></textarea>
                     </div>
@@ -305,6 +309,19 @@
                     <div class="field">
                         <label for="groupmeMessageSuffix">Message suffix</label>
                         <input id="groupmeMessageSuffix" name="groupmeMessageSuffix" placeholder=" - https://example.com" />
+                    </div>
+                    <div class="field" style="grid-column: span 2;">
+                        <label for="channels">Channels (JSON array)</label>
+                        <textarea id="channels" name="channels" placeholder='[{"name":"Fire","botId":"abc","webhookUrl":"https://api.groupme.com/v3/bots/post","messageSuffix":"https://calls.example.com/","sendUploadNotification":true,"sendTranscription":true,"includeAudioLink":true}]' rows="6"></textarea>
+                        <small style="color: var(--muted); display: block; margin-top: 6px;">Configure per-channel delivery for uploads and transcriptions.</small>
+                    </div>
+                    <div class="field">
+                        <label for="streamUrl">Icecast stream URL</label>
+                        <input id="streamUrl" name="streamUrl" placeholder="http://example.com:8000/stream" />
+                    </div>
+                    <div class="field">
+                        <label for="streamSegmentSeconds">Stream segment seconds</label>
+                        <input id="streamSegmentSeconds" name="streamSegmentSeconds" type="number" min="5" step="1" />
                     </div>
                     <div class="field">
                         <label for="webServerPort">Web server port</label>
@@ -383,7 +400,7 @@
                 if (!response.ok) throw new Error('Failed to load configuration');
                 const cfg = await response.json();
 
-                const fields = ['environment', 'watchDir', 'openaiApiKey', 'groupmeBotId', 'webhookUrl', 'processingDelay', 'maxMessageLength', 'systemPrompt', 'webServerPort', 'openaiModel', 'groupmeMessageSuffix'];
+                const fields = ['environment', 'watchDir', 'openaiApiKey', 'groupmeBotId', 'webhookUrl', 'processingDelay', 'maxMessageLength', 'systemPrompt', 'webServerPort', 'openaiModel', 'openaiTranscriptionModel', 'groupmeMessageSuffix', 'streamUrl', 'streamSegmentSeconds'];
                 fields.forEach((field) => {
                     const input = document.getElementById(field);
                     if (!input) return;
@@ -393,6 +410,11 @@
                         input.value = cfg[field] || '';
                     }
                 });
+
+                const channelsInput = document.getElementById('channels');
+                if (channelsInput) {
+                    channelsInput.value = JSON.stringify(cfg.channels || [], null, 2);
+                }
 
                 chipWatch.textContent = `Watching: ${cfg.watchDir}`;
                 setStatus('', '');
@@ -405,6 +427,21 @@
             event.preventDefault();
             setStatus('Saving configuration...', '');
 
+            let channels = [];
+            const channelsRaw = document.getElementById('channels')?.value.trim();
+            if (channelsRaw) {
+                try {
+                    const parsed = JSON.parse(channelsRaw);
+                    if (!Array.isArray(parsed)) {
+                        throw new Error('Channels must be a JSON array');
+                    }
+                    channels = parsed;
+                } catch (error) {
+                    setStatus(error.message || 'Invalid channels JSON', 'error');
+                    return;
+                }
+            }
+
             const payload = {
                 environment: document.getElementById('environment').value,
                 watchDir: document.getElementById('watchDir').value,
@@ -416,7 +453,11 @@
                 systemPrompt: document.getElementById('systemPrompt').value,
                 webServerPort: document.getElementById('webServerPort').value,
                 openaiModel: document.getElementById('openaiModel').value,
+                openaiTranscriptionModel: document.getElementById('openaiTranscriptionModel').value,
                 groupmeMessageSuffix: document.getElementById('groupmeMessageSuffix').value,
+                channels,
+                streamUrl: document.getElementById('streamUrl').value,
+                streamSegmentSeconds: Number(document.getElementById('streamSegmentSeconds').value),
             };
 
             try {
