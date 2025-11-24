@@ -363,8 +363,9 @@
                             <tr>
                                 <th style="width: 180px;">Timestamp</th>
                                 <th style="width: 220px;">File</th>
+                                <th style="width: 200px;">Transmission</th>
                                 <th>Corrected transcription</th>
-                                <th style="width: 110px;">Actions</th>
+                                <th style="width: 120px;">Actions</th>
                             </tr>
                         </thead>
                         <tbody id="table-body">
@@ -377,9 +378,20 @@
                             <tr>
                                 <td>{{.Timestamp.Format "2006-01-02 15:04:05"}}</td>
                                 <td class="filename"><a href="https://calls.sussexcountyalerts.com/{{.FileName}}" target="_blank" rel="noopener">{{.FileName}}</a></td>
+                                <td>
+                                    <div class="pill" style="margin-bottom: 6px;">{{if .Source}}{{.Source}}{{else}}UPLOAD{{end}}</div>
+                                    {{if .Metadata.NormalizedTag}}
+                                    <div class="badge">{{.Metadata.NormalizedTag}}</div>
+                                    {{else}}
+                                    <div class="badge">No stream metadata</div>
+                                    {{end}}
+                                </td>
                                 <td>{{.CorrectedText}}</td>
                                 <td>
                                     <div class="badge">Original: {{.OriginalText}}</div>
+                                    {{if .Metadata.SelectedTag}}
+                                    <div class="badge">Raw tag: {{.Metadata.SelectedTag}}</div>
+                                    {{end}}
                                     <button class="copy-btn" data-text="{{.CorrectedText}}">Copy</button>
                                 </td>
                             </tr>
