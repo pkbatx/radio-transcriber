@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -38,6 +39,7 @@ type PageData struct {
 
 type ChannelConfig struct {
 	Name                   string `json:"name"`
+	Platform               string `json:"platform"`
 	BotID                  string `json:"botId"`
 	WebhookURL             string `json:"webhookUrl"`
 	MessageSuffix          string `json:"messageSuffix"`
@@ -64,8 +66,7 @@ type Config struct {
 	StreamSegmentSeconds int             `json:"streamSegmentSeconds"`
 }
 
-const defaultSystemPrompt = `You are a highly specialized transcription assistant for public safety dispatch communications.
-Your task is to transcribe emergency radio transmissions with absolute precision. Ensure all unit identifiers, codes, locations, and technical terms are accurately captured. Apply correct spelling, punctuation, and capitalization. Do not include any irrelevant content, such as external links (e.g., websites), promotional messages, or information that was not explicitly communicated in the radio transmission. Ensure the transcription strictly reflects the call content as spoken.`
+const defaultSystemPrompt = `You are a 2025-ready emergency communications transcription assistant built for mission-critical radio traffic. Deliver verbatim, high-confidence transcripts that preserve unit identifiers, call signs, street names, and incident details. Follow current NENA/APCO clarity standards: expand clipped words only when the intent is unmistakable, keep plain language, and avoid invented content or links. Apply punctuation for readability without altering meaning, and prefer concise, line-broken output when multiple transmissions are present.`
 
 var (
 	configFilePath    = "config.json"
@@ -98,9 +99,9 @@ func loadConfig() Config {
 		MaxMessageLength:     1000,
 		SystemPrompt:         defaultSystemPrompt,
 		WebServerPort:        "8080",
-		OpenAIModel:          "gpt-4",
+		OpenAIModel:          "gpt-4.1",
 		GroupmeMessageSuffix: " - https://calls.sussexcountyalerts.com/",
-		OpenAITranscription:  "whisper-1",
+		OpenAITranscription:  "gpt-4o-mini-transcribe",
 		StreamSegmentSeconds: 60,
 	}
 
@@ -143,10 +144,10 @@ func loadConfig() Config {
 		cfg.WebhookURL = "https://api.groupme.com/v3/bots/post"
 	}
 	if cfg.OpenAIModel == "" {
-		cfg.OpenAIModel = "gpt-4"
+		cfg.OpenAIModel = "gpt-4.1"
 	}
 	if cfg.OpenAITranscription == "" {
-		cfg.OpenAITranscription = "whisper-1"
+		cfg.OpenAITranscription = "gpt-4o-mini-transcribe"
 	}
 	if cfg.GroupmeMessageSuffix == "" {
 		cfg.GroupmeMessageSuffix = " - https://calls.sussexcountyalerts.com/"
@@ -172,6 +173,7 @@ func loadConfig() Config {
 		cfg.Channels = []ChannelConfig{
 			{
 				Name:                   "default",
+				Platform:               "groupme",
 				BotID:                  cfg.GroupmeBotID,
 				WebhookURL:             cfg.WebhookURL,
 				MessageSuffix:          cfg.GroupmeMessageSuffix,
@@ -352,6 +354,16 @@ func handleNewFile(filePath string) {
 	time.Sleep(time.Duration(cfg.ProcessingDelay) * time.Second)
 
 	fileName := filepath.Base(filePath)
+
+	silent, err := isAudioSilent(filePath)
+	if err != nil {
+		log.Printf("Silence check failed for %s: %v", fileName, err)
+	}
+	if err == nil && silent {
+		log.Printf("Skipping %s because the stream segment is silent", fileName)
+		return
+	}
+
 	notifyUpload(fileName, cfg)
 
 	transcription, err := transcribeAudio(filePath)
@@ -375,7 +387,7 @@ func notifyUpload(fileName string, cfg Config) {
 		if channel.IncludeAudioLink && link != "" {
 			message = fmt.Sprintf("%s %s", message, link)
 		}
-		sendGroupMeMessage(message, channel, cfg)
+		dispatchMessage(message, channel, cfg)
 	}
 }
 
@@ -394,7 +406,7 @@ func sendTranscriptionToChannels(transcription, fileName string, cfg Config) {
 			messageText = fmt.Sprintf("%s %s", transcription, link)
 		}
 
-		sendGroupMeMessage(messageText, channel, cfg)
+		dispatchMessage(messageText, channel, cfg)
 	}
 }
 
@@ -408,6 +420,32 @@ func buildAudioLink(cfg Config, channel ChannelConfig, fileName string) string {
 	}
 
 	return fmt.Sprintf("%s%s", suffix, fileName)
+}
+
+func isAudioSilent(filePath string) (bool, error) {
+	cmd := exec.Command("ffmpeg", "-i", filePath, "-af", "volumedetect", "-vn", "-sn", "-dn", "-f", "null", "/dev/null")
+	output, err := cmd.CombinedOutput()
+	if err != nil && len(output) == 0 {
+		return false, fmt.Errorf("ffmpeg volumedetect failed: %w", err)
+	}
+
+	outputStr := string(output)
+	volumePattern := regexp.MustCompile(`max_volume:\s*([^\s]+) dB`)
+	matches := volumePattern.FindStringSubmatch(outputStr)
+	if len(matches) < 2 {
+		return false, fmt.Errorf("unable to parse max volume from ffmpeg output")
+	}
+
+	if strings.EqualFold(matches[1], "-inf") {
+		return true, nil
+	}
+
+	maxVolume, parseErr := strconv.ParseFloat(matches[1], 64)
+	if parseErr != nil {
+		return false, fmt.Errorf("unable to parse volume level: %w", parseErr)
+	}
+
+	return maxVolume <= -55.0, nil
 }
 
 func transcribeAudio(filePath string) (string, error) {
@@ -444,7 +482,7 @@ func transcribeAudio(filePath string) (string, error) {
 
 	model := cfg.OpenAITranscription
 	if model == "" {
-		model = "whisper-1"
+		model = "gpt-4o-mini-transcribe"
 	}
 
 	_ = writer.WriteField("model", model)
@@ -566,6 +604,37 @@ func postProcessTranscription(transcription string) (string, error) {
 	return correctedTranscription, nil
 }
 
+func dispatchMessage(message string, channel ChannelConfig, cfg Config) {
+	platform := strings.ToLower(strings.TrimSpace(channel.Platform))
+	if platform == "" {
+		platform = "groupme"
+	}
+
+	switch platform {
+	case "discord":
+		sendDiscordMessage(message, channel, cfg)
+	default:
+		sendGroupMeMessage(message, channel, cfg)
+	}
+}
+
+func chunkMessage(message string, maxLen int) []string {
+	if maxLen <= 0 {
+		maxLen = 1000
+	}
+
+	chunks := make([]string, 0, (len(message)/maxLen)+1)
+	for start := 0; start < len(message); start += maxLen {
+		end := start + maxLen
+		if end > len(message) {
+			end = len(message)
+		}
+		chunks = append(chunks, message[start:end])
+	}
+
+	return chunks
+}
+
 func sendGroupMeMessage(message string, channel ChannelConfig, cfg Config) {
 	webhook := channel.WebhookURL
 	if webhook == "" {
@@ -581,18 +650,7 @@ func sendGroupMeMessage(message string, channel ChannelConfig, cfg Config) {
 		maxLen = 1000
 	}
 
-	numMessages := int(float64(len(message)) / float64(maxLen))
-	if len(message)%maxLen != 0 {
-		numMessages++
-	}
-
-	for i := 0; i < numMessages; i++ {
-		start := i * maxLen
-		end := start + maxLen
-		if end > len(message) {
-			end = len(message)
-		}
-		chunk := message[start:end]
+	for _, chunk := range chunkMessage(message, maxLen) {
 		payload := map[string]string{
 			"bot_id": channel.BotID,
 			"text":   chunk,
@@ -615,13 +673,62 @@ func sendGroupMeMessage(message string, channel ChannelConfig, cfg Config) {
 			log.Println("Error sending message to GroupMe:", err)
 			continue
 		}
-		defer resp.Body.Close()
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
 
 		if resp.StatusCode == http.StatusAccepted || resp.StatusCode == http.StatusOK {
 			log.Println("Message sent to GroupMe channel", channel.Name)
 		} else {
-			bodyBytes, _ := io.ReadAll(resp.Body)
 			log.Printf("Failed to send message to GroupMe: %d - %s\n", resp.StatusCode, string(bodyBytes))
+		}
+	}
+}
+
+func sendDiscordMessage(message string, channel ChannelConfig, cfg Config) {
+	webhook := channel.WebhookURL
+	if webhook == "" {
+		webhook = cfg.WebhookURL
+	}
+	if strings.TrimSpace(webhook) == "" {
+		log.Println("Missing Discord webhook for channel; skipping dispatch.")
+		return
+	}
+
+	maxLen := cfg.MaxMessageLength
+	if maxLen <= 0 || maxLen > 2000 {
+		maxLen = 2000
+	}
+
+	for _, chunk := range chunkMessage(message, maxLen) {
+		payload := map[string]string{
+			"content": chunk,
+		}
+
+		payloadBytes, err := json.Marshal(payload)
+		if err != nil {
+			log.Println("Error marshaling Discord payload:", err)
+			continue
+		}
+
+		req, err := http.NewRequest("POST", webhook, bytes.NewReader(payloadBytes))
+		if err != nil {
+			log.Println("Error creating Discord request:", err)
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			log.Println("Error sending message to Discord:", err)
+			continue
+		}
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			log.Println("Message sent to Discord channel", channel.Name)
+		} else {
+			log.Printf("Failed to send message to Discord: %d - %s\n", resp.StatusCode, string(bodyBytes))
 		}
 	}
 }
