@@ -542,7 +542,8 @@ func preprocessAudio(inputFilePath string) (string, error) {
 }
 
 func waitForStableFile(path string, attempts int, delay time.Duration) error {
-	var prevSize int64
+	var prevSize int64 = -1
+	var lastNonZeroSize int64
 
 	for i := 0; i < attempts; i++ {
 		info, err := os.Stat(path)
@@ -551,11 +552,11 @@ func waitForStableFile(path string, attempts int, delay time.Duration) error {
 		}
 
 		size := info.Size()
-		if size == 0 {
-			return fmt.Errorf("file is empty")
+		if size > 0 {
+			lastNonZeroSize = size
 		}
 
-		if size == prevSize && i > 0 {
+		if size == prevSize && size > 0 {
 			if err := validateAudioFile(path); err != nil {
 				return err
 			}
@@ -565,6 +566,10 @@ func waitForStableFile(path string, attempts int, delay time.Duration) error {
 
 		prevSize = size
 		time.Sleep(delay)
+	}
+
+	if lastNonZeroSize == 0 {
+		return fmt.Errorf("file remained empty after %d attempts", attempts)
 	}
 
 	return fmt.Errorf("file did not stabilize after %d attempts", attempts)
