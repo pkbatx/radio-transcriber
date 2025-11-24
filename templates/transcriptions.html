@@ -1,33 +1,275 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>Recent Transcriptions</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Radio Transcriber | Live Feed</title>
     <style>
-        body { font-family: Arial, sans-serif; margin: 20px; }
-        h1 { color: #333; }
-        table { width: 100%; border-collapse: collapse; margin-top: 20px; }
-        th, td { border: 1px solid #ccc; padding: 8px; text-align: left; }
-        th { background-color: #f2f2f2; }
-        tr:nth-child(even) { background-color: #f9f9f9; }
-        .timestamp { width: 180px; }
-        .filename { width: 200px; }
+        :root {
+            --bg: #0c1222;
+            --card: #111a2f;
+            --muted: #c6d1e9;
+            --text: #eaf0ff;
+            --accent: #63b3ff;
+            --border: #1f2b45;
+            --success: #4ade80;
+        }
+
+        * { box-sizing: border-box; }
+
+        body {
+            margin: 0;
+            background: radial-gradient(circle at 10% 20%, rgba(99, 179, 255, 0.08), transparent 25%),
+                        radial-gradient(circle at 90% 10%, rgba(74, 222, 128, 0.08), transparent 25%),
+                        linear-gradient(135deg, #0b1221, #0c1222 45%, #0b1221);
+            color: var(--text);
+            font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            min-height: 100vh;
+            padding: 32px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        .header {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: space-between;
+            gap: 16px;
+            margin-bottom: 24px;
+            align-items: center;
+        }
+
+        .title {
+            margin: 0;
+            font-size: 28px;
+            font-weight: 700;
+            letter-spacing: -0.02em;
+        }
+
+        .subtitle {
+            margin: 6px 0 0;
+            color: var(--muted);
+            max-width: 700px;
+        }
+
+        .meta {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .chip {
+            background: rgba(99, 179, 255, 0.12);
+            border: 1px solid var(--border);
+            padding: 8px 12px;
+            border-radius: 999px;
+            font-size: 13px;
+            color: var(--text);
+        }
+
+        .panel {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            box-shadow: 0 12px 40px rgba(0, 0, 0, 0.25);
+            padding: 16px;
+        }
+
+        .controls {
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+            align-items: center;
+            margin-bottom: 16px;
+        }
+
+        .search {
+            flex: 1;
+            min-width: 220px;
+            background: rgba(255, 255, 255, 0.02);
+            border: 1px solid var(--border);
+            color: var(--text);
+            padding: 12px 14px;
+            border-radius: 12px;
+            font-size: 14px;
+        }
+
+        .button {
+            background: var(--accent);
+            color: #0b1221;
+            border: none;
+            padding: 12px 14px;
+            border-radius: 12px;
+            font-weight: 600;
+            cursor: pointer;
+            box-shadow: 0 8px 20px rgba(99, 179, 255, 0.35);
+        }
+
+        .table-wrapper {
+            overflow: auto;
+            border-radius: 12px;
+            border: 1px solid var(--border);
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            min-width: 720px;
+        }
+
+        th, td {
+            padding: 12px;
+            border-bottom: 1px solid var(--border);
+            text-align: left;
+        }
+
+        thead th {
+            position: sticky;
+            top: 0;
+            background: rgba(12, 18, 34, 0.94);
+            backdrop-filter: blur(6px);
+            z-index: 1;
+            font-size: 13px;
+            color: var(--muted);
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }
+
+        tbody tr:hover {
+            background: rgba(99, 179, 255, 0.05);
+        }
+
+        .filename a {
+            color: var(--accent);
+            text-decoration: none;
+            font-weight: 600;
+        }
+
+        .filename a:hover { text-decoration: underline; }
+
+        .badge {
+            display: block;
+            margin-bottom: 6px;
+            font-size: 13px;
+            color: var(--muted);
+            word-break: break-word;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 32px 0;
+            color: var(--muted);
+        }
+
+        .copy-btn {
+            background: rgba(255, 255, 255, 0.04);
+            border: 1px solid var(--border);
+            color: var(--text);
+            padding: 8px 10px;
+            border-radius: 10px;
+            cursor: pointer;
+            font-size: 13px;
+        }
+
+        .pill {
+            display: inline-flex;
+            padding: 4px 10px;
+            border-radius: 999px;
+            background: rgba(74, 222, 128, 0.12);
+            color: var(--success);
+            font-size: 12px;
+            border: 1px solid rgba(74, 222, 128, 0.35);
+        }
     </style>
 </head>
 <body>
-    <h1>Recent Transcriptions</h1>
-    <table>
-        <tr>
-            <th class="timestamp">Timestamp</th>
-            <th class="filename">File Name</th>
-            <th>Transcription</th>
-        </tr>
-        {{range .}}
-        <tr>
-            <td>{{.Timestamp.Format "2006-01-02 15:04:05"}}</td>
-            <td><a href="https://calls.sussexcountyalerts.com/{{.FileName}}" target="_blank">{{.FileName}}</a></td>
-            <td>{{.CorrectedText}}</td>
-        </tr>
-        {{end}}
-    </table>
+    <main class="container">
+        <div class="header">
+            <div>
+                <p class="pill">Live monitoring</p>
+                <h1 class="title">Radio Transcriber</h1>
+                <p class="subtitle">Browse the latest corrected transcriptions captured from the watch directory and quickly search, copy, or open the source audio.</p>
+            </div>
+            <div class="meta">
+                <span class="chip">Watching: {{.WatchDir}}</span>
+                <span class="chip">Entries: {{.Total}}</span>
+                <span class="chip">Updated: {{if .LastUpdated.IsZero}}Pending{{else}}{{.LastUpdated.Format "2006-01-02 15:04:05 MST"}}{{end}}</span>
+            </div>
+        </div>
+
+        <section class="panel">
+            <div class="controls">
+                <input id="search" class="search" type="search" placeholder="Filter by text, timestamp, or filename..." aria-label="Filter transcriptions">
+                <button class="button" id="refresh">Refresh feed</button>
+            </div>
+
+            <div class="table-wrapper">
+                <table aria-label="Recent transcriptions">
+                    <thead>
+                        <tr>
+                            <th style="width: 180px;">Timestamp</th>
+                            <th style="width: 220px;">File</th>
+                            <th>Corrected transcription</th>
+                            <th style="width: 110px;">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="table-body">
+                        {{if eq (len .Transcriptions) 0}}
+                        <tr data-empty="true">
+                            <td colspan="4" class="empty-state">No transcriptions yet. New items will appear here as they are processed.</td>
+                        </tr>
+                        {{else}}
+                        {{range .Transcriptions}}
+                        <tr>
+                            <td>{{.Timestamp.Format "2006-01-02 15:04:05"}}</td>
+                            <td class="filename"><a href="https://calls.sussexcountyalerts.com/{{.FileName}}" target="_blank" rel="noopener">{{.FileName}}</a></td>
+                            <td>{{.CorrectedText}}</td>
+                            <td>
+                                <div class="badge">Original: {{.OriginalText}}</div>
+                                <button class="copy-btn" data-text="{{.CorrectedText}}">Copy</button>
+                            </td>
+                        </tr>
+                        {{end}}
+                        {{end}}
+                    </tbody>
+                </table>
+            </div>
+        </section>
+    </main>
+
+    <script>
+        const searchInput = document.getElementById('search');
+        const tableBody = document.getElementById('table-body');
+        const refresh = document.getElementById('refresh');
+
+        searchInput?.addEventListener('input', () => {
+            const term = searchInput.value.toLowerCase();
+            tableBody.querySelectorAll('tr').forEach((row) => {
+                if (row.dataset.empty) return;
+                const text = row.textContent?.toLowerCase() || '';
+                row.style.display = text.includes(term) ? '' : 'none';
+            });
+        });
+
+        refresh?.addEventListener('click', () => window.location.reload());
+
+        tableBody.addEventListener('click', (event) => {
+            const target = event.target;
+            if (!(target instanceof HTMLElement)) return;
+            if (!target.classList.contains('copy-btn')) return;
+
+            const text = target.getAttribute('data-text') || '';
+            navigator.clipboard.writeText(text).then(() => {
+                target.textContent = 'Copied!';
+                setTimeout(() => target.textContent = 'Copy', 1500);
+            }).catch(() => {
+                target.textContent = 'Copy failed';
+                setTimeout(() => target.textContent = 'Copy', 2000);
+            });
+        });
+    </script>
 </body>
 </html>
