@@ -259,6 +259,25 @@
         .status.success { color: var(--success); }
         .status.error { color: var(--danger); }
         .status.note { color: var(--warning); }
+
+        .section-title {
+            margin: 6px 0;
+            font-size: 16px;
+            font-weight: 700;
+        }
+
+        .helper-text {
+            color: var(--muted);
+            font-size: 13px;
+            margin: 4px 0 12px;
+        }
+
+        .chip-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 6px;
+        }
     </style>
 </head>
 <body>
@@ -278,6 +297,20 @@
         </div>
 
         <section class="grid">
+            <section class="panel" aria-label="Live stream timing">
+                <div class="controls" style="justify-content: space-between; align-items: flex-start;">
+                    <div>
+                        <h2 style="margin: 0; font-size: 18px;">Live stream cadence</h2>
+                        <p class="helper-text">Segment length and processing wait for the Icecast feed are tracked separately so uploads stay instant.</p>
+                    </div>
+                </div>
+                <div class="chip-row" aria-live="polite">
+                    <span class="chip" id="chip-segment-length">Segment length: pending</span>
+                    <span class="chip" id="chip-stream-delay">Stream wait: pending</span>
+                    <span class="chip" id="chip-metadata-poll">Metadata poll: pending</span>
+                </div>
+            </section>
+
             <section class="panel">
                 <div class="controls">
                     <h2 style="margin: 0; font-size: 18px;">Configuration</h2>
@@ -285,6 +318,8 @@
                 </div>
 
                 <form id="config-form" class="form-grid">
+                    <div class="section-title" style="grid-column: 1 / -1;">Uploads & notifications</div>
+                    <div class="helper-text" style="grid-column: 1 / -1;">Upload automation stays immediate. Live stream timing is tuned separately below.</div>
                     <div class="field">
                         <label for="environment">Environment</label>
                         <input id="environment" name="environment" placeholder="dev / prod" />
@@ -292,10 +327,6 @@
                     <div class="field">
                         <label for="uploadDir">Upload watch directory</label>
                         <input id="uploadDir" name="uploadDir" placeholder="./watched_directory" required />
-                    </div>
-                    <div class="field">
-                        <label for="streamDir">Stream watch directory</label>
-                        <input id="streamDir" name="streamDir" placeholder="./stream_segments" required />
                     </div>
                     <div class="field">
                         <label for="openaiApiKey">OpenAI API key</label>
@@ -314,11 +345,6 @@
                     <div class="field">
                         <label for="processingDelay">Processing delay (seconds)</label>
                         <input id="processingDelay" name="processingDelay" type="number" min="0" step="1" />
-                    </div>
-                    <div class="field">
-                        <label for="streamProcessingDelay">Stream processing delay (seconds)</label>
-                        <input id="streamProcessingDelay" name="streamProcessingDelay" type="number" min="0" step="1" />
-                        <small style="color: var(--muted); display: block; margin-top: 6px;">Wait time before processing stream segments so recordings finish writing.</small>
                     </div>
                     <div class="field">
                         <label for="maxMessageLength">Max message length</label>
@@ -366,6 +392,17 @@
                         <textarea id="channels" name="channels" placeholder='[{"name":"Fire","botId":"abc","webhookUrl":"https://api.groupme.com/v3/bots/post","messageSuffix":"https://calls.example.com/","sendUploadNotification":true,"sendTranscription":true,"includeAudioLink":true}]' rows="6"></textarea>
                         <small style="color: var(--muted); display: block; margin-top: 6px;">Configure per-channel delivery for uploads and transcriptions.</small>
                     </div>
+                    <div class="section-title" style="grid-column: 1 / -1;">Live stream ingest (Icecast)</div>
+                    <div class="helper-text" style="grid-column: 1 / -1;">Segment length and the stream-only processing delay are isolated from upload handling.</div>
+                    <div class="field">
+                        <label for="streamDir">Stream watch directory</label>
+                        <input id="streamDir" name="streamDir" placeholder="./stream_segments" required />
+                    </div>
+                    <div class="field">
+                        <label for="streamProcessingDelay">Stream processing delay (seconds)</label>
+                        <input id="streamProcessingDelay" name="streamProcessingDelay" type="number" min="0" step="1" />
+                        <small style="color: var(--muted); display: block; margin-top: 6px;">Wait time before processing stream segments so recordings finish writing; upload processing stays immediate.</small>
+                    </div>
                     <div class="field">
                         <label for="streamUrl">Icecast stream URL</label>
                         <input id="streamUrl" name="streamUrl" placeholder="http://example.com:8000/stream" />
@@ -373,11 +410,17 @@
                     <div class="field">
                         <label for="streamSegmentSeconds">Stream segment seconds</label>
                         <input id="streamSegmentSeconds" name="streamSegmentSeconds" type="number" min="5" step="1" />
+                        <small style="color: var(--muted); display: block; margin-top: 6px;">How long each live segment runs before being closed and transcribed.</small>
                     </div>
                     <div class="field">
-                        <label for="metadataWebsocketUrl">Metadata websocket URL</label>
-                        <input id="metadataWebsocketUrl" name="metadataWebsocketUrl" placeholder="wss://example.com/" />
-                        <small style="color: var(--muted); display: block; margin-top: 6px;">Leave blank to derive from the stream URL.</small>
+                        <label for="metadataWebsocketUrl">Metadata source URL</label>
+                        <input id="metadataWebsocketUrl" name="metadataWebsocketUrl" placeholder="https://example.com/?all or wss://example.com/" />
+                        <small style="color: var(--muted); display: block; margin-top: 6px;">Supports WebSocket endpoints or ProScan /?all pages; HTTP sources are polled automatically.</small>
+                    </div>
+                    <div class="field">
+                        <label for="metadataPollIntervalSeconds">Metadata poll interval (seconds)</label>
+                        <input id="metadataPollIntervalSeconds" name="metadataPollIntervalSeconds" type="number" min="1" step="1" />
+                        <small style="color: var(--muted); display: block; margin-top: 6px;">Used for HTTP/HTTPS metadata pages; WebSocket feeds ignore this value.</small>
                     </div>
                     <div class="field">
                         <label for="databasePath">Database path</label>
@@ -478,6 +521,9 @@
         const statusEl = document.getElementById('config-status');
         const chipUpload = document.getElementById('chip-upload');
         const chipStream = document.getElementById('chip-stream');
+        const chipSegmentLength = document.getElementById('chip-segment-length');
+        const chipStreamDelay = document.getElementById('chip-stream-delay');
+        const chipMetadataPoll = document.getElementById('chip-metadata-poll');
         const chipTotal = document.getElementById('chip-total');
         const transcriptionModelSelect = document.getElementById('openaiTranscriptionModel');
         const transcriptionModelCustom = document.getElementById('openaiTranscriptionModelCustom');
@@ -547,7 +593,7 @@
                 if (!response.ok) throw new Error('Failed to load configuration');
                 const cfg = await response.json();
 
-                const fields = ['environment', 'uploadDir', 'streamDir', 'openaiApiKey', 'groupmeBotId', 'groupmeWebhookUrl', 'discordWebhookUrl', 'genericWebhookUrl', 'processingDelay', 'streamProcessingDelay', 'maxMessageLength', 'webServerPort', 'openaiModel', 'groupmeMessageSuffix', 'streamUrl', 'streamSegmentSeconds', 'metadataWebsocketUrl', 'databasePath', 'ftpPort', 'ftpUser', 'ftpPassword'];
+                const fields = ['environment', 'uploadDir', 'streamDir', 'openaiApiKey', 'groupmeBotId', 'groupmeWebhookUrl', 'discordWebhookUrl', 'genericWebhookUrl', 'processingDelay', 'streamProcessingDelay', 'maxMessageLength', 'webServerPort', 'openaiModel', 'groupmeMessageSuffix', 'streamUrl', 'streamSegmentSeconds', 'metadataWebsocketUrl', 'metadataPollIntervalSeconds', 'databasePath', 'ftpPort', 'ftpUser', 'ftpPassword'];
                 fields.forEach((field) => {
                         const input = document.getElementById(field);
                         if (!input) return;
@@ -580,6 +626,12 @@
                 populateTranscriptionModels(cfg.openaiTranscriptionModel || '');
                 if (chipUpload) chipUpload.textContent = `Uploads: ${cfg.uploadDir || cfg.watchDir}`;
                 if (chipStream) chipStream.textContent = `Stream: ${cfg.streamDir}`;
+                const segmentSeconds = Number(cfg.streamSegmentSeconds) || 0;
+                const streamDelay = Number(cfg.streamProcessingDelay ?? cfg.processingDelay) || 0;
+                const metadataPoll = Number(cfg.metadataPollIntervalSeconds ?? cfg.metadataPollInterval) || 0;
+                if (chipSegmentLength) chipSegmentLength.textContent = `Segment length: ${segmentSeconds > 0 ? `${segmentSeconds}s` : 'n/a'}`;
+                if (chipStreamDelay) chipStreamDelay.textContent = `Stream wait: ${streamDelay > 0 ? `${streamDelay}s` : 'n/a'}`;
+                if (chipMetadataPoll) chipMetadataPoll.textContent = `Metadata poll: ${metadataPoll > 0 ? `${metadataPoll}s` : 'n/a'}`;
                 setStatus('', '');
             } catch (error) {
                 setStatus(error.message, 'error');
@@ -638,6 +690,7 @@
                 channels,
                 streamUrl: document.getElementById('streamUrl').value,
                 streamSegmentSeconds: Number(document.getElementById('streamSegmentSeconds').value),
+                metadataPollIntervalSeconds: Number(document.getElementById('metadataPollIntervalSeconds').value),
                 ftpEnabled: ftpEnabledInput?.checked ?? false,
                 ftpPort: document.getElementById('ftpPort').value,
                 ftpUser: document.getElementById('ftpUser').value,
@@ -659,6 +712,12 @@
                 const updated = await response.json();
                 if (chipUpload) chipUpload.textContent = `Uploads: ${updated.uploadDir || updated.watchDir}`;
                 if (chipStream) chipStream.textContent = `Stream: ${updated.streamDir}`;
+                const updatedSegmentSeconds = Number(updated.streamSegmentSeconds) || 0;
+                const updatedStreamDelay = Number(updated.streamProcessingDelay ?? updated.processingDelay) || 0;
+                const updatedMetadataPoll = Number(updated.metadataPollIntervalSeconds ?? updated.metadataPollInterval) || 0;
+                if (chipSegmentLength) chipSegmentLength.textContent = `Segment length: ${updatedSegmentSeconds > 0 ? `${updatedSegmentSeconds}s` : 'n/a'}`;
+                if (chipStreamDelay) chipStreamDelay.textContent = `Stream wait: ${updatedStreamDelay > 0 ? `${updatedStreamDelay}s` : 'n/a'}`;
+                if (chipMetadataPoll) chipMetadataPoll.textContent = `Metadata poll: ${updatedMetadataPoll > 0 ? `${updatedMetadataPoll}s` : 'n/a'}`;
                 setStatus('Configuration saved. Watchers updated.', 'success');
             } catch (error) {
                 setStatus(error.message, 'error');
