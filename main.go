@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"io"
@@ -20,8 +22,10 @@ import (
 	"sync"
 	"time"
 
+	ftpserver "github.com/fclairamb/ftpserverlib"
 	"github.com/fsnotify/fsnotify"
 	"github.com/joho/godotenv"
+	"github.com/spf13/afero"
 )
 
 type Transcription struct {
@@ -53,26 +57,33 @@ type ChannelConfig struct {
 }
 
 type Config struct {
-	Environment           string          `json:"environment"`
-	WatchDir              string          `json:"watchDir"`
-	UploadDir             string          `json:"uploadDir"`
-	StreamDir             string          `json:"streamDir"`
-	OpenAIAPIKey          string          `json:"openaiApiKey"`
-	GroupmeBotID          string          `json:"groupmeBotId"`
-	GroupmeWebhookURL     string          `json:"groupmeWebhookUrl"`
-	DiscordWebhookURL     string          `json:"discordWebhookUrl"`
-	GenericWebhookURL     string          `json:"genericWebhookUrl"`
-	WebhookURL            string          `json:"webhookUrl"`
-	ProcessingDelay       int             `json:"processingDelay"`
-	StreamProcessingDelay int             `json:"streamProcessingDelay"`
-	MaxMessageLength      int             `json:"maxMessageLength"`
-	WebServerPort         string          `json:"webServerPort"`
-	OpenAIModel           string          `json:"openaiModel"`
-	GroupmeMessageSuffix  string          `json:"groupmeMessageSuffix"`
-	OpenAITranscription   string          `json:"openaiTranscriptionModel"`
-	Channels              []ChannelConfig `json:"channels"`
-	StreamURL             string          `json:"streamUrl"`
-	StreamSegmentSeconds  int             `json:"streamSegmentSeconds"`
+	Environment            string          `json:"environment"`
+	WatchDir               string          `json:"watchDir"`
+	UploadDir              string          `json:"uploadDir"`
+	StreamDir              string          `json:"streamDir"`
+	OpenAIAPIKey           string          `json:"openaiApiKey"`
+	GroupmeBotID           string          `json:"groupmeBotId"`
+	GroupmeWebhookURL      string          `json:"groupmeWebhookUrl"`
+	DiscordWebhookURL      string          `json:"discordWebhookUrl"`
+	GenericWebhookURL      string          `json:"genericWebhookUrl"`
+	WebhookURL             string          `json:"webhookUrl"`
+	SendUploadNotification bool            `json:"sendUploadNotification"`
+	SendTranscription      bool            `json:"sendTranscription"`
+	IncludeAudioLink       bool            `json:"includeAudioLink"`
+	ProcessingDelay        int             `json:"processingDelay"`
+	StreamProcessingDelay  int             `json:"streamProcessingDelay"`
+	MaxMessageLength       int             `json:"maxMessageLength"`
+	WebServerPort          string          `json:"webServerPort"`
+	OpenAIModel            string          `json:"openaiModel"`
+	GroupmeMessageSuffix   string          `json:"groupmeMessageSuffix"`
+	OpenAITranscription    string          `json:"openaiTranscriptionModel"`
+	Channels               []ChannelConfig `json:"channels"`
+	StreamURL              string          `json:"streamUrl"`
+	StreamSegmentSeconds   int             `json:"streamSegmentSeconds"`
+	FTPEnabled             bool            `json:"ftpEnabled"`
+	FTPPort                string          `json:"ftpPort"`
+	FTPUser                string          `json:"ftpUser"`
+	FTPPassword            string          `json:"ftpPassword"`
 }
 
 type StreamMetadata struct {
@@ -97,6 +108,8 @@ var (
 	streamWatcherWG     sync.WaitGroup
 	streamCancel        context.CancelFunc
 	streamWG            sync.WaitGroup
+	ftpServerInstance   *ftpserver.FtpServer
+	ftpServerMux        sync.Mutex
 )
 
 func init() {
@@ -107,19 +120,23 @@ func init() {
 
 func loadConfig() Config {
 	cfg := Config{
-		Environment:           "dev",
-		WatchDir:              "./watched_directory",
-		UploadDir:             "./watched_directory",
-		StreamDir:             "./stream_segments",
-		GroupmeWebhookURL:     "https://api.groupme.com/v3/bots/post",
-		ProcessingDelay:       1,
-		StreamProcessingDelay: 60,
-		MaxMessageLength:      1000,
-		WebServerPort:         "8080",
-		OpenAIModel:           "gpt-4.1",
-		GroupmeMessageSuffix:  " - https://calls.sussexcountyalerts.com/",
-		OpenAITranscription:   "gpt-4o-mini-transcribe",
-		StreamSegmentSeconds:  60,
+		Environment:            "dev",
+		WatchDir:               "./watched_directory",
+		UploadDir:              "./watched_directory",
+		StreamDir:              "./stream_segments",
+		GroupmeWebhookURL:      "https://api.groupme.com/v3/bots/post",
+		SendUploadNotification: true,
+		SendTranscription:      true,
+		IncludeAudioLink:       true,
+		ProcessingDelay:        1,
+		StreamProcessingDelay:  60,
+		MaxMessageLength:       1000,
+		WebServerPort:          "8080",
+		OpenAIModel:            "gpt-4.1",
+		GroupmeMessageSuffix:   " - https://calls.sussexcountyalerts.com/",
+		OpenAITranscription:    "gpt-4o-mini-transcribe",
+		StreamSegmentSeconds:   60,
+		FTPPort:                "2121",
 	}
 
 	if data, err := os.ReadFile(configFilePath); err == nil {
@@ -183,6 +200,9 @@ func loadConfig() Config {
 	}
 	if cfg.GroupmeMessageSuffix == "" {
 		cfg.GroupmeMessageSuffix = " - https://calls.sussexcountyalerts.com/"
+	}
+	if cfg.FTPPort == "" {
+		cfg.FTPPort = "2121"
 	}
 	if cfg.ProcessingDelay <= 0 {
 		cfg.ProcessingDelay = 1
@@ -326,6 +346,92 @@ func startStreamRecorder(streamURL, outputDir string, segmentSeconds int) error 
 	return nil
 }
 
+type ftpDriver struct {
+	fs       afero.Fs
+	settings *ftpserver.Settings
+	user     string
+	pass     string
+}
+
+func newFTPDriver(root, user, pass, listenAddr string) *ftpDriver {
+	basePath := afero.NewBasePathFs(afero.NewOsFs(), root)
+
+	return &ftpDriver{
+		fs:   basePath,
+		user: strings.TrimSpace(user),
+		pass: pass,
+		settings: &ftpserver.Settings{
+			ListenAddr: listenAddr,
+			Banner:     "FTP drop server ready",
+		},
+	}
+}
+
+func (d *ftpDriver) GetSettings() (*ftpserver.Settings, error) {
+	return d.settings, nil
+}
+
+func (d *ftpDriver) ClientConnected(_ ftpserver.ClientContext) (string, error) {
+	return "Connected to drop server", nil
+}
+
+func (d *ftpDriver) ClientDisconnected(_ ftpserver.ClientContext) {}
+
+func (d *ftpDriver) AuthUser(_ ftpserver.ClientContext, user, pass string) (ftpserver.ClientDriver, error) {
+	if d.user == "" {
+		return d.fs, nil
+	}
+
+	if strings.EqualFold(user, d.user) && (d.pass == "" || pass == d.pass) {
+		return d.fs, nil
+	}
+
+	return nil, fmt.Errorf("invalid credentials")
+}
+
+func (d *ftpDriver) GetTLSConfig() (*tls.Config, error) {
+	return nil, nil
+}
+
+func startFTPServer(cfg Config) error {
+	ftpServerMux.Lock()
+	defer ftpServerMux.Unlock()
+
+	if ftpServerInstance != nil {
+		_ = ftpServerInstance.Stop()
+		ftpServerInstance = nil
+	}
+
+	if !cfg.FTPEnabled {
+		return nil
+	}
+
+	port := strings.TrimSpace(cfg.FTPPort)
+	if port == "" {
+		port = "2121"
+	}
+
+	listenAddr := ":" + port
+	driver := newFTPDriver(cfg.UploadDir, cfg.FTPUser, cfg.FTPPassword, listenAddr)
+	server := ftpserver.NewFtpServer(driver)
+
+	if err := server.Listen(); err != nil {
+		return fmt.Errorf("unable to start FTP server: %w", err)
+	}
+
+	ftpServerInstance = server
+
+	go func() {
+		if err := server.Serve(); err != nil && !errors.Is(err, io.EOF) {
+			log.Printf("FTP server stopped: %v", err)
+		}
+	}()
+
+	log.Printf("FTP drop server listening on %s and writing to %s", server.Addr(), cfg.UploadDir)
+
+	return nil
+}
+
 func buildStreamRecorderArgs(streamURL, outputPattern string, segmentSeconds int) []string {
 	silenceFilter := fmt.Sprintf("silencedetect=noise=%ddB:d=%.2f", -55, 0.6)
 
@@ -413,6 +519,10 @@ func main() {
 
 	if err := startStreamRecorder(cfg.StreamURL, cfg.StreamDir, cfg.StreamSegmentSeconds); err != nil {
 		log.Fatalf("Error starting stream recorder: %v", err)
+	}
+
+	if err := startFTPServer(cfg); err != nil {
+		log.Fatalf("Error starting FTP server: %v", err)
 	}
 
 	tmplPath := filepath.Join("templates", "transcriptions.html")
@@ -534,13 +644,20 @@ func processNewFile(filePath string, delaySeconds int, cfg Config, source string
 }
 
 func notifyUpload(fileName string, cfg Config, source string, metadata StreamMetadata) {
+	if !cfg.SendUploadNotification {
+		return
+	}
+
 	for _, channel := range cfg.Channels {
 		if !channel.SendUploadNotification {
 			continue
 		}
-		link := buildAudioLink(cfg, channel, fileName)
+		link := ""
+		if cfg.IncludeAudioLink && channel.IncludeAudioLink {
+			link = buildAudioLink(cfg, channel, fileName)
+		}
 		message := formatMessageWithMetadata(fmt.Sprintf("New call uploaded: %s", fileName), source, metadata)
-		if channel.IncludeAudioLink && link != "" {
+		if cfg.IncludeAudioLink && channel.IncludeAudioLink && link != "" {
 			message = fmt.Sprintf("%s %s", message, link)
 		}
 		dispatchMessage(message, channel, cfg)
@@ -548,12 +665,16 @@ func notifyUpload(fileName string, cfg Config, source string, metadata StreamMet
 }
 
 func sendTranscriptionToChannels(transcription, fileName string, cfg Config, source string, metadata StreamMetadata) {
+	if !cfg.SendTranscription {
+		return
+	}
+
 	for _, channel := range cfg.Channels {
 		if !channel.SendTranscription {
 			continue
 		}
 		link := ""
-		if channel.IncludeAudioLink {
+		if cfg.IncludeAudioLink && channel.IncludeAudioLink {
 			link = buildAudioLink(cfg, channel, fileName)
 		}
 
@@ -1089,6 +1210,13 @@ func configAPIHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		if previous.FTPEnabled != updated.FTPEnabled || previous.FTPPort != updated.FTPPort || previous.UploadDir != updated.UploadDir || previous.FTPUser != updated.FTPUser || previous.FTPPassword != updated.FTPPassword {
+			if err := startFTPServer(updated); err != nil {
+				http.Error(w, "Failed to restart FTP server", http.StatusInternalServerError)
+				return
+			}
+		}
+
 		respondWithJSON(w, updated)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -1136,6 +1264,9 @@ func mergeConfig(current, incoming Config) Config {
 	if incoming.WebhookURL != "" {
 		current.WebhookURL = incoming.WebhookURL
 	}
+	current.SendUploadNotification = incoming.SendUploadNotification
+	current.SendTranscription = incoming.SendTranscription
+	current.IncludeAudioLink = incoming.IncludeAudioLink
 	if incoming.ProcessingDelay > 0 {
 		current.ProcessingDelay = incoming.ProcessingDelay
 	}
@@ -1169,11 +1300,22 @@ func mergeConfig(current, incoming Config) Config {
 	if incoming.StreamProcessingDelay > 0 {
 		current.StreamProcessingDelay = incoming.StreamProcessingDelay
 	}
+	current.FTPEnabled = incoming.FTPEnabled
+	if incoming.FTPPort != "" {
+		current.FTPPort = incoming.FTPPort
+	}
+	if incoming.FTPUser != "" || incoming.FTPPassword != "" {
+		current.FTPUser = incoming.FTPUser
+		current.FTPPassword = incoming.FTPPassword
+	}
 	if current.StreamProcessingDelay <= 0 {
 		current.StreamProcessingDelay = 60
 	}
 	if current.StreamDir == "" {
 		current.StreamDir = filepath.Join(current.UploadDir, "stream_segments")
+	}
+	if strings.TrimSpace(current.FTPPort) == "" {
+		current.FTPPort = "2121"
 	}
 
 	return current
@@ -1202,6 +1344,9 @@ func validateConfig(cfg Config) error {
 	}
 	if cfg.WebServerPort == "" {
 		return fmt.Errorf("web server port is required")
+	}
+	if cfg.FTPEnabled && strings.TrimSpace(cfg.FTPPort) == "" {
+		return fmt.Errorf("FTP port is required when FTP is enabled")
 	}
 	if strings.TrimSpace(cfg.StreamURL) != "" && cfg.StreamSegmentSeconds <= 0 {
 		return fmt.Errorf("stream segment seconds must be positive when stream URL is set")
