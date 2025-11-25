@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -430,6 +431,58 @@ func startDirectoryWatcher(dir string, cancelRef *context.CancelFunc, wg *sync.W
 	return nil
 }
 
+func watchDirectory(ctx context.Context, dir string, handler func(string)) error {
+	if handler == nil {
+		return fmt.Errorf("handler is required for watchDirectory")
+	}
+
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("unable to prepare watch directory: %w", err)
+	}
+
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return fmt.Errorf("failed to create watcher: %w", err)
+	}
+	defer watcher.Close()
+
+	if err := watcher.Add(dir); err != nil {
+		return fmt.Errorf("failed to watch directory %s: %w", dir, err)
+	}
+
+	// Process any files that already exist when the watcher starts.
+	if err := filepath.WalkDir(dir, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() {
+			return nil
+		}
+		go handler(path)
+		return nil
+	}); err != nil {
+		return fmt.Errorf("failed to walk initial directory state: %w", err)
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case event, ok := <-watcher.Events:
+			if !ok {
+				return nil
+			}
+			if event.Op&(fsnotify.Create|fsnotify.Write|fsnotify.Rename) != 0 {
+				go handler(event.Name)
+			}
+		case err := <-watcher.Errors:
+			if err != nil {
+				log.Println("Watcher error:", err)
+			}
+		}
+	}
+}
+
 type ftpDriver struct {
 	fs       afero.Fs
 	settings *ftpserver.Settings
@@ -514,6 +567,91 @@ func startFTPServer(cfg Config) error {
 	log.Printf("FTP drop server listening on %s and writing to %s", server.Addr(), cfg.UploadDir)
 
 	return nil
+}
+
+func handleUploadFile(path string) {
+	if strings.TrimSpace(path) == "" {
+		return
+	}
+
+	absPath, err := filepath.Abs(path)
+	if err == nil {
+		path = absPath
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		return
+	}
+
+	if info.IsDir() {
+		return
+	}
+
+	processedFilesMux.Lock()
+	if processedFiles[path] {
+		processedFilesMux.Unlock()
+		return
+	}
+	processedFiles[path] = true
+	processedFilesMux.Unlock()
+
+	if err := waitForStableFile(path, 10, 500*time.Millisecond); err != nil {
+		log.Printf("Skipping unstable file %s: %v", filepath.Base(path), err)
+		return
+	}
+
+	silent, err := isAudioSilent(path)
+	if err != nil {
+		log.Printf("Unable to inspect audio %s: %v", filepath.Base(path), err)
+		return
+	}
+	if silent {
+		log.Printf("Skipping silent audio file: %s", filepath.Base(path))
+		return
+	}
+
+	transcription, err := transcribeAudio(path)
+	if err != nil {
+		log.Printf("Failed to transcribe %s: %v", filepath.Base(path), err)
+		return
+	}
+
+	metadata := StreamMetadata{
+		RawTags:       map[string]string{"filename": filepath.Base(path)},
+		SelectedTag:   strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)),
+		NormalizedTag: normalizeTransmissionLabel(strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))),
+		ReceivedAt:    time.Now(),
+	}
+
+	cfg := getConfig()
+	corrected := strings.TrimSpace(transcription)
+	message := formatMessageWithMetadata(corrected, metadata.NormalizedTag, metadata)
+	messageSuffix := firstNonEmpty(cfg.GroupmeMessageSuffix)
+	if messageSuffix != "" {
+		message = strings.TrimSpace(message + " " + messageSuffix)
+	}
+
+	storeTranscription(filepath.Base(path), transcription, corrected, metadata.NormalizedTag, metadata)
+
+	for _, channel := range cfg.Channels {
+		if channel.SendUploadNotification || cfg.SendUploadNotification {
+			notice := fmt.Sprintf("New audio received: %s", filepath.Base(path))
+			if cfg.IncludeAudioLink {
+				notice = fmt.Sprintf("%s (%s)", notice, path)
+			}
+			notice = formatMessageWithMetadata(notice, metadata.NormalizedTag, metadata)
+			dispatchMessage(notice, channel, cfg)
+		}
+
+		if channel.SendTranscription || cfg.SendTranscription {
+			channelMessage := message
+			if suffix := strings.TrimSpace(channel.MessageSuffix); suffix != "" {
+				channelMessage = strings.TrimSpace(channelMessage + " " + suffix)
+			}
+			dispatchMessage(channelMessage, channel, cfg)
+		}
+	}
 }
 
 func buildStreamRecorderArgs(streamURL, outputPattern string, segmentSeconds int) []string {
@@ -1037,6 +1175,41 @@ func configAPIHandler(w http.ResponseWriter, r *http.Request) {
 func respondWithJSON(w http.ResponseWriter, payload interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func main() {
+	cfg := loadConfig()
+
+	if err := validateConfig(cfg); err != nil {
+		log.Fatal("Invalid configuration:", err)
+	}
+
+	setConfig(cfg)
+
+	if err := os.MkdirAll(cfg.UploadDir, 0o755); err != nil {
+		log.Fatal("Failed to prepare upload directory:", err)
+	}
+
+	if err := initDatabase(cfg.DatabasePath); err != nil {
+		log.Fatal("Failed to initialize database:", err)
+	}
+
+	var err error
+	tmpl, err = template.ParseFiles("templates/transcriptions.html")
+	if err != nil {
+		log.Fatal("Failed to load templates:", err)
+	}
+
+	if err := startUploadWatcher(cfg.UploadDir); err != nil {
+		log.Fatal("Failed to start upload watcher:", err)
+	}
+
+	if err := startFTPServer(cfg); err != nil {
+		log.Fatal("Failed to start FTP server:", err)
+	}
+
+	log.Printf("Radio Transcriber ready in %s mode. Watching %s and serving on %s", cfg.Environment, cfg.UploadDir, cfg.WebServerPort)
+	startWebServer(cfg.WebServerPort)
 }
 
 func mergeConfig(current, incoming Config) Config {
