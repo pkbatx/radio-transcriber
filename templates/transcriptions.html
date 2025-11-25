@@ -375,6 +375,16 @@
                         <input id="streamSegmentSeconds" name="streamSegmentSeconds" type="number" min="5" step="1" />
                     </div>
                     <div class="field">
+                        <label for="metadataWebsocketUrl">Metadata websocket URL</label>
+                        <input id="metadataWebsocketUrl" name="metadataWebsocketUrl" placeholder="wss://example.com/" />
+                        <small style="color: var(--muted); display: block; margin-top: 6px;">Leave blank to derive from the stream URL.</small>
+                    </div>
+                    <div class="field">
+                        <label for="databasePath">Database path</label>
+                        <input id="databasePath" name="databasePath" placeholder="transcriptions.db" />
+                        <small style="color: var(--muted); display: block; margin-top: 6px;">Lite SQL storage for recent transcriptions.</small>
+                    </div>
+                    <div class="field">
                         <label for="webServerPort">Web server port</label>
                         <input id="webServerPort" name="webServerPort" placeholder="8080" />
                     </div>
@@ -537,7 +547,7 @@
                 if (!response.ok) throw new Error('Failed to load configuration');
                 const cfg = await response.json();
 
-                const fields = ['environment', 'uploadDir', 'streamDir', 'openaiApiKey', 'groupmeBotId', 'groupmeWebhookUrl', 'discordWebhookUrl', 'genericWebhookUrl', 'processingDelay', 'streamProcessingDelay', 'maxMessageLength', 'webServerPort', 'openaiModel', 'groupmeMessageSuffix', 'streamUrl', 'streamSegmentSeconds', 'ftpPort', 'ftpUser', 'ftpPassword'];
+                const fields = ['environment', 'uploadDir', 'streamDir', 'openaiApiKey', 'groupmeBotId', 'groupmeWebhookUrl', 'discordWebhookUrl', 'genericWebhookUrl', 'processingDelay', 'streamProcessingDelay', 'maxMessageLength', 'webServerPort', 'openaiModel', 'groupmeMessageSuffix', 'streamUrl', 'streamSegmentSeconds', 'metadataWebsocketUrl', 'databasePath', 'ftpPort', 'ftpUser', 'ftpPassword'];
                 fields.forEach((field) => {
                         const input = document.getElementById(field);
                         if (!input) return;
@@ -604,13 +614,15 @@
                 return;
             }
 
-            const payload = {
-                environment: document.getElementById('environment').value,
-                uploadDir: document.getElementById('uploadDir').value,
-                streamDir: document.getElementById('streamDir').value,
-                openaiApiKey: document.getElementById('openaiApiKey').value,
-                groupmeBotId: document.getElementById('groupmeBotId').value,
-                groupmeWebhookUrl: document.getElementById('groupmeWebhookUrl').value,
+                const payload = {
+                        environment: document.getElementById('environment').value,
+                        uploadDir: document.getElementById('uploadDir').value,
+                        streamDir: document.getElementById('streamDir').value,
+                        metadataWebsocketUrl: document.getElementById('metadataWebsocketUrl').value,
+                        databasePath: document.getElementById('databasePath').value,
+                        openaiApiKey: document.getElementById('openaiApiKey').value,
+                        groupmeBotId: document.getElementById('groupmeBotId').value,
+                        groupmeWebhookUrl: document.getElementById('groupmeWebhookUrl').value,
                 discordWebhookUrl: document.getElementById('discordWebhookUrl').value,
                 genericWebhookUrl: document.getElementById('genericWebhookUrl').value,
                 sendUploadNotification: sendUploadNotificationInput?.checked ?? true,

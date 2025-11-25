@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,8 +25,10 @@ import (
 
 	ftpserver "github.com/fclairamb/ftpserverlib"
 	"github.com/fsnotify/fsnotify"
+	"github.com/gorilla/websocket"
 	"github.com/joho/godotenv"
 	"github.com/spf13/afero"
+	_ "modernc.org/sqlite"
 )
 
 type Transcription struct {
@@ -61,6 +64,8 @@ type Config struct {
 	WatchDir               string          `json:"watchDir"`
 	UploadDir              string          `json:"uploadDir"`
 	StreamDir              string          `json:"streamDir"`
+	MetadataWebsocketURL   string          `json:"metadataWebsocketUrl"`
+	DatabasePath           string          `json:"databasePath"`
 	OpenAIAPIKey           string          `json:"openaiApiKey"`
 	GroupmeBotID           string          `json:"groupmeBotId"`
 	GroupmeWebhookURL      string          `json:"groupmeWebhookUrl"`
@@ -90,6 +95,38 @@ type StreamMetadata struct {
 	RawTags       map[string]string
 	SelectedTag   string
 	NormalizedTag string
+	ReceivedAt    time.Time
+}
+
+type MetadataTracker struct {
+	mux   sync.RWMutex
+	last  StreamMetadata
+	ready bool
+}
+
+func (m *MetadataTracker) Update(meta StreamMetadata) {
+	meta.ReceivedAt = time.Now()
+
+	m.mux.Lock()
+	defer m.mux.Unlock()
+
+	m.last = meta
+	m.ready = true
+}
+
+func (m *MetadataTracker) Current(maxAge time.Duration) StreamMetadata {
+	m.mux.RLock()
+	defer m.mux.RUnlock()
+
+	if !m.ready {
+		return StreamMetadata{}
+	}
+
+	if maxAge > 0 && time.Since(m.last.ReceivedAt) > maxAge {
+		return StreamMetadata{}
+	}
+
+	return m.last
 }
 
 var (
@@ -110,6 +147,11 @@ var (
 	streamWG            sync.WaitGroup
 	ftpServerInstance   *ftpserver.FtpServer
 	ftpServerMux        sync.Mutex
+	metadataCancel      context.CancelFunc
+	metadataWG          sync.WaitGroup
+	metadataTracker     = &MetadataTracker{}
+	dbConn              *sql.DB
+	dbMux               sync.RWMutex
 )
 
 func init() {
@@ -124,6 +166,7 @@ func loadConfig() Config {
 		WatchDir:               "./watched_directory",
 		UploadDir:              "./watched_directory",
 		StreamDir:              "./stream_segments",
+		DatabasePath:           "transcriptions.db",
 		GroupmeWebhookURL:      "https://api.groupme.com/v3/bots/post",
 		SendUploadNotification: true,
 		SendTranscription:      true,
@@ -148,6 +191,8 @@ func loadConfig() Config {
 		cfg.WatchDir = firstNonEmpty(os.Getenv("WATCH_DIR"), cfg.WatchDir)
 		cfg.UploadDir = firstNonEmpty(os.Getenv("UPLOAD_DIR"), cfg.UploadDir)
 		cfg.StreamDir = firstNonEmpty(os.Getenv("STREAM_DIR"), cfg.StreamDir)
+		cfg.MetadataWebsocketURL = firstNonEmpty(os.Getenv("METADATA_WEBSOCKET_URL"), cfg.MetadataWebsocketURL)
+		cfg.DatabasePath = firstNonEmpty(os.Getenv("DATABASE_PATH"), cfg.DatabasePath)
 		cfg.OpenAIAPIKey = firstNonEmpty(os.Getenv("OPENAI_API_KEY"), cfg.OpenAIAPIKey)
 		cfg.GroupmeBotID = firstNonEmpty(os.Getenv("GROUPME_BOT_ID"), cfg.GroupmeBotID)
 		cfg.GroupmeWebhookURL = firstNonEmpty(os.Getenv("GROUPME_WEBHOOK_URL"), cfg.GroupmeWebhookURL)
@@ -263,6 +308,154 @@ func getConfig() Config {
 	configMux.RLock()
 	defer configMux.RUnlock()
 	return config
+}
+
+func initDatabase(path string) error {
+	dbMux.Lock()
+	if dbConn != nil {
+		_ = dbConn.Close()
+		dbConn = nil
+	}
+	trimmed := strings.TrimSpace(path)
+	if trimmed == "" {
+		dbMux.Unlock()
+		transcriptionsMux.Lock()
+		transcriptions = nil
+		transcriptionsMux.Unlock()
+		return nil
+	}
+
+	if dir := filepath.Dir(trimmed); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			dbMux.Unlock()
+			return err
+		}
+	}
+
+	conn, err := sql.Open("sqlite", trimmed)
+	if err != nil {
+		dbMux.Unlock()
+		return err
+	}
+	conn.SetMaxOpenConns(1)
+
+	createTable := `CREATE TABLE IF NOT EXISTS transcriptions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT,
+                file_name TEXT,
+                original_text TEXT,
+                corrected_text TEXT,
+                source TEXT,
+                raw_tags TEXT,
+                selected_tag TEXT,
+                normalized_tag TEXT,
+                metadata_received_at TEXT
+        )`
+
+	if _, err := conn.Exec(createTable); err != nil {
+		dbMux.Unlock()
+		return fmt.Errorf("unable to initialize database: %w", err)
+	}
+
+	dbConn = conn
+	dbMux.Unlock()
+
+	return loadTranscriptionsFromDB()
+}
+
+func loadTranscriptionsFromDB() error {
+	dbMux.RLock()
+	conn := dbConn
+	dbMux.RUnlock()
+
+	if conn == nil {
+		return nil
+	}
+
+	rows, err := conn.Query(`SELECT timestamp, file_name, original_text, corrected_text, source, raw_tags, selected_tag, normalized_tag, metadata_received_at FROM transcriptions ORDER BY datetime(timestamp) DESC LIMIT ?`, maxTranscriptions)
+	if err != nil {
+		return fmt.Errorf("unable to load transcriptions: %w", err)
+	}
+	defer rows.Close()
+
+	var loaded []Transcription
+	for rows.Next() {
+		var (
+			tsStr      string
+			fileName   string
+			original   string
+			corrected  string
+			source     string
+			rawTagsStr string
+			selected   string
+			normalized string
+			receivedAt string
+		)
+
+		if err := rows.Scan(&tsStr, &fileName, &original, &corrected, &source, &rawTagsStr, &selected, &normalized, &receivedAt); err != nil {
+			return fmt.Errorf("unable to scan transcription row: %w", err)
+		}
+
+		t := Transcription{FileName: fileName, OriginalText: original, CorrectedText: corrected, Source: source}
+		if tsStr != "" {
+			if parsed, err := time.Parse(time.RFC3339Nano, tsStr); err == nil {
+				t.Timestamp = parsed
+			}
+		}
+
+		t.Metadata = StreamMetadata{RawTags: make(map[string]string), SelectedTag: selected, NormalizedTag: normalized}
+		if receivedAt != "" {
+			if parsed, err := time.Parse(time.RFC3339Nano, receivedAt); err == nil {
+				t.Metadata.ReceivedAt = parsed
+			}
+		}
+
+		if rawTagsStr != "" {
+			_ = json.Unmarshal([]byte(rawTagsStr), &t.Metadata.RawTags)
+		}
+
+		loaded = append(loaded, t)
+	}
+
+	for i, j := 0, len(loaded)-1; i < j; i, j = i+1, j-1 {
+		loaded[i], loaded[j] = loaded[j], loaded[i]
+	}
+
+	transcriptionsMux.Lock()
+	transcriptions = loaded
+	transcriptionsMux.Unlock()
+
+	return nil
+}
+
+func persistTranscription(t Transcription) {
+	dbMux.RLock()
+	conn := dbConn
+	dbMux.RUnlock()
+
+	if conn == nil {
+		return
+	}
+
+	rawTagsStr := ""
+	if len(t.Metadata.RawTags) > 0 {
+		if raw, err := json.Marshal(t.Metadata.RawTags); err == nil {
+			rawTagsStr = string(raw)
+		}
+	}
+
+	receivedAt := ""
+	if !t.Metadata.ReceivedAt.IsZero() {
+		receivedAt = t.Metadata.ReceivedAt.UTC().Format(time.RFC3339Nano)
+	}
+
+	_, err := conn.Exec(
+		`INSERT INTO transcriptions (timestamp, file_name, original_text, corrected_text, source, raw_tags, selected_tag, normalized_tag, metadata_received_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		t.Timestamp.UTC().Format(time.RFC3339Nano), t.FileName, t.OriginalText, t.CorrectedText, t.Source, rawTagsStr, t.Metadata.SelectedTag, t.Metadata.NormalizedTag, receivedAt,
+	)
+	if err != nil {
+		log.Printf("Failed to persist transcription: %v", err)
+	}
 }
 
 func startUploadWatcher(dir string) error {
@@ -491,6 +684,165 @@ func redactCredentials(raw string) string {
 	return parsed.String()
 }
 
+func deriveMetadataWebsocketURL(cfg Config) string {
+	if strings.TrimSpace(cfg.MetadataWebsocketURL) != "" {
+		return cfg.MetadataWebsocketURL
+	}
+
+	normalizedStream, err := normalizeStreamURL(cfg.StreamURL)
+	if err != nil || strings.TrimSpace(normalizedStream) == "" {
+		return ""
+	}
+
+	parsed, err := url.Parse(normalizedStream)
+	if err != nil || parsed.Host == "" {
+		return ""
+	}
+
+	if parsed.Scheme == "https" {
+		parsed.Scheme = "wss"
+	} else {
+		parsed.Scheme = "ws"
+	}
+
+	parsed.Path = "/"
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+
+	return parsed.String()
+}
+
+func startMetadataCollector(rawURL string) error {
+	if metadataCancel != nil {
+		metadataCancel()
+		metadataWG.Wait()
+	}
+
+	trimmed := strings.TrimSpace(rawURL)
+	if trimmed == "" {
+		log.Println("Metadata websocket URL not configured; skipping metadata listener")
+		return nil
+	}
+
+	parsed, err := url.Parse(trimmed)
+	if err != nil {
+		return fmt.Errorf("invalid metadata websocket url: %w", err)
+	}
+	if parsed.Scheme == "" {
+		parsed.Scheme = "ws"
+	}
+	if parsed.Scheme == "http" {
+		parsed.Scheme = "ws"
+	}
+	if parsed.Scheme == "https" {
+		parsed.Scheme = "wss"
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	metadataCancel = cancel
+
+	metadataWG.Add(1)
+	go func(target string) {
+		defer metadataWG.Done()
+
+		dialer := websocket.Dialer{HandshakeTimeout: 10 * time.Second}
+		backoff := time.Second * 3
+
+		for ctx.Err() == nil {
+			conn, _, err := dialer.Dial(target, nil)
+			if err != nil {
+				log.Printf("Metadata websocket connection failed: %v", err)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(backoff):
+					continue
+				}
+			}
+
+			log.Printf("Metadata websocket connected to %s", redactCredentials(target))
+
+			for ctx.Err() == nil {
+				_, msg, err := conn.ReadMessage()
+				if err != nil {
+					if !errors.Is(err, context.Canceled) {
+						log.Printf("Metadata websocket read error: %v", err)
+					}
+					break
+				}
+
+				if meta, ok := parseMetadataMessage(string(msg)); ok {
+					metadataTracker.Update(meta)
+				}
+			}
+
+			_ = conn.Close()
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+		}
+	}(parsed.String())
+
+	return nil
+}
+
+func parseMetadataMessage(msg string) (StreamMetadata, bool) {
+	parts := strings.SplitN(msg, ",", 2)
+	if len(parts) < 2 || strings.TrimSpace(parts[0]) != "S" {
+		return StreamMetadata{}, false
+	}
+
+	payload := parts[1]
+	lines := strings.Split(payload, "\r\n")
+	if len(lines) < 3 {
+		return StreamMetadata{}, false
+	}
+
+	metadataValue := strings.ReplaceAll(lines[2], "Chr(44)", ",")
+	rawTags := map[string]string{
+		"listeners":      lines[0],
+		"peak_listeners": lines[1],
+		"metadata":       metadataValue,
+	}
+	if len(lines) > 3 {
+		rawTags["scanner_type"] = strings.TrimPrefix(lines[3], "ST=")
+	}
+
+	selected := strings.TrimSpace(metadataValue)
+
+	return StreamMetadata{
+		RawTags:       rawTags,
+		SelectedTag:   selected,
+		NormalizedTag: normalizeTransmissionLabel(selected),
+		ReceivedAt:    time.Now(),
+	}, true
+}
+
+func mergeStreamMetadata(primary, fallback StreamMetadata) StreamMetadata {
+	result := primary
+
+	if result.RawTags == nil {
+		result.RawTags = make(map[string]string)
+	}
+
+	for k, v := range fallback.RawTags {
+		if _, exists := result.RawTags[k]; !exists {
+			result.RawTags[k] = v
+		}
+	}
+
+	if strings.TrimSpace(result.SelectedTag) == "" && fallback.SelectedTag != "" {
+		result.SelectedTag = fallback.SelectedTag
+		result.NormalizedTag = fallback.NormalizedTag
+		result.ReceivedAt = fallback.ReceivedAt
+	}
+
+	return result
+}
+
 func main() {
 	cfg := loadConfig()
 	if err := saveConfig(cfg); err != nil {
@@ -498,6 +850,10 @@ func main() {
 	}
 
 	setConfig(cfg)
+
+	if err := initDatabase(cfg.DatabasePath); err != nil {
+		log.Fatalf("Error initializing database: %v", err)
+	}
 
 	if err := os.MkdirAll(cfg.UploadDir, 0o755); err != nil {
 		log.Fatalf("Error creating upload watch directory: %v", err)
@@ -519,6 +875,11 @@ func main() {
 
 	if err := startStreamRecorder(cfg.StreamURL, cfg.StreamDir, cfg.StreamSegmentSeconds); err != nil {
 		log.Fatalf("Error starting stream recorder: %v", err)
+	}
+
+	metadataURL := deriveMetadataWebsocketURL(cfg)
+	if err := startMetadataCollector(metadataURL); err != nil {
+		log.Fatalf("Error starting metadata listener: %v", err)
 	}
 
 	if err := startFTPServer(cfg); err != nil {
@@ -619,6 +980,10 @@ func processNewFile(filePath string, delaySeconds int, cfg Config, source string
 	metadata := StreamMetadata{}
 	if source == "stream" {
 		metadata = extractStreamMetadata(filePath)
+		liveMetadata := metadataTracker.Current(10 * time.Minute)
+		if liveMetadata.SelectedTag != "" || len(liveMetadata.RawTags) > 0 {
+			metadata = mergeStreamMetadata(metadata, liveMetadata)
+		}
 	}
 
 	silent, err := isAudioSilent(filePath)
@@ -734,6 +1099,9 @@ func extractStreamMetadata(filePath string) StreamMetadata {
 	)
 	meta.SelectedTag = strings.TrimSpace(meta.SelectedTag)
 	meta.NormalizedTag = normalizeTransmissionLabel(meta.SelectedTag)
+	if meta.NormalizedTag != "" {
+		meta.ReceivedAt = time.Now()
+	}
 
 	return meta
 }
@@ -1101,9 +1469,6 @@ func sendGenericWebhookMessage(message string, channel ChannelConfig, cfg Config
 }
 
 func storeTranscription(fileName, originalText, correctedText, source string, metadata StreamMetadata) {
-	transcriptionsMux.Lock()
-	defer transcriptionsMux.Unlock()
-
 	t := Transcription{
 		Timestamp:     time.Now(),
 		FileName:      fileName,
@@ -1112,6 +1477,11 @@ func storeTranscription(fileName, originalText, correctedText, source string, me
 		Source:        strings.ToUpper(strings.TrimSpace(source)),
 		Metadata:      metadata,
 	}
+
+	persistTranscription(t)
+
+	transcriptionsMux.Lock()
+	defer transcriptionsMux.Unlock()
 
 	transcriptions = append(transcriptions, t)
 
@@ -1210,6 +1580,20 @@ func configAPIHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		if previous.DatabasePath != updated.DatabasePath {
+			if err := initDatabase(updated.DatabasePath); err != nil {
+				http.Error(w, "Failed to switch database", http.StatusInternalServerError)
+				return
+			}
+		}
+
+		if previous.MetadataWebsocketURL != updated.MetadataWebsocketURL || previous.StreamURL != updated.StreamURL {
+			if err := startMetadataCollector(deriveMetadataWebsocketURL(updated)); err != nil {
+				http.Error(w, "Failed to restart metadata listener", http.StatusInternalServerError)
+				return
+			}
+		}
+
 		if previous.FTPEnabled != updated.FTPEnabled || previous.FTPPort != updated.FTPPort || previous.UploadDir != updated.UploadDir || previous.FTPUser != updated.FTPUser || previous.FTPPassword != updated.FTPPassword {
 			if err := startFTPServer(updated); err != nil {
 				http.Error(w, "Failed to restart FTP server", http.StatusInternalServerError)
@@ -1297,6 +1681,12 @@ func mergeConfig(current, incoming Config) Config {
 	if incoming.StreamDir != "" {
 		current.StreamDir = incoming.StreamDir
 	}
+	if incoming.MetadataWebsocketURL != "" {
+		current.MetadataWebsocketURL = incoming.MetadataWebsocketURL
+	}
+	if incoming.DatabasePath != "" {
+		current.DatabasePath = incoming.DatabasePath
+	}
 	if incoming.StreamProcessingDelay > 0 {
 		current.StreamProcessingDelay = incoming.StreamProcessingDelay
 	}
@@ -1350,6 +1740,11 @@ func validateConfig(cfg Config) error {
 	}
 	if strings.TrimSpace(cfg.StreamURL) != "" && cfg.StreamSegmentSeconds <= 0 {
 		return fmt.Errorf("stream segment seconds must be positive when stream URL is set")
+	}
+	if trimmed := strings.TrimSpace(cfg.MetadataWebsocketURL); trimmed != "" {
+		if _, err := url.Parse(trimmed); err != nil {
+			return fmt.Errorf("invalid metadata websocket url: %w", err)
+		}
 	}
 	if filepath.Clean(uploadDir) == filepath.Clean(streamDir) {
 		return fmt.Errorf("stream directory must be different from upload directory")
