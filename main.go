@@ -65,6 +65,7 @@ type Config struct {
 	UploadDir              string          `json:"uploadDir"`
 	StreamDir              string          `json:"streamDir"`
 	MetadataWebsocketURL   string          `json:"metadataWebsocketUrl"`
+	MetadataPollInterval   int             `json:"metadataPollIntervalSeconds"`
 	DatabasePath           string          `json:"databasePath"`
 	OpenAIAPIKey           string          `json:"openaiApiKey"`
 	GroupmeBotID           string          `json:"groupmeBotId"`
@@ -183,6 +184,7 @@ func loadConfig() Config {
 		WatchDir:               "./watched_directory",
 		UploadDir:              "./watched_directory",
 		StreamDir:              "./stream_segments",
+		MetadataPollInterval:   5,
 		DatabasePath:           "transcriptions.db",
 		GroupmeWebhookURL:      "https://api.groupme.com/v3/bots/post",
 		SendUploadNotification: true,
@@ -237,6 +239,11 @@ func loadConfig() Config {
 		cfg.WebServerPort = firstNonEmpty(os.Getenv("WEB_SERVER_PORT"), cfg.WebServerPort)
 		cfg.OpenAIModel = firstNonEmpty(os.Getenv("OPENAI_MODEL"), cfg.OpenAIModel)
 		cfg.GroupmeMessageSuffix = firstNonEmpty(os.Getenv("GROUPME_MESSAGE_SUFFIX"), cfg.GroupmeMessageSuffix)
+		if val := os.Getenv("METADATA_POLL_INTERVAL_SECONDS"); val != "" {
+			if parsed, err := strconv.Atoi(val); err == nil {
+				cfg.MetadataPollInterval = parsed
+			}
+		}
 	}
 
 	if cfg.UploadDir == "" {
@@ -274,6 +281,9 @@ func loadConfig() Config {
 	}
 	if cfg.StreamProcessingDelay <= 0 {
 		cfg.StreamProcessingDelay = 60
+	}
+	if cfg.MetadataPollInterval <= 0 {
+		cfg.MetadataPollInterval = 5
 	}
 	if cfg.MaxMessageLength <= 0 {
 		cfg.MaxMessageLength = 1000
@@ -740,7 +750,7 @@ func startMetadataCollector(rawURL string, cfg Config) error {
 
 	trimmed := strings.TrimSpace(rawURL)
 	if trimmed == "" {
-		log.Println("Metadata websocket URL not configured; skipping metadata listener")
+		log.Println("Metadata source URL not configured; skipping metadata listener")
 		return nil
 	}
 
@@ -748,19 +758,36 @@ func startMetadataCollector(rawURL string, cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("invalid metadata websocket url: %w", err)
 	}
+
 	if parsed.Scheme == "" {
 		parsed.Scheme = "ws"
 	}
-	if parsed.Scheme == "http" {
-		parsed.Scheme = "ws"
-	}
-	if parsed.Scheme == "https" {
-		parsed.Scheme = "wss"
-	}
 
+	scheme := strings.ToLower(parsed.Scheme)
 	ctx, cancel := context.WithCancel(context.Background())
 	metadataCancel = cancel
 
+	switch scheme {
+	case "ws", "wss":
+		startMetadataWebsocketLoop(ctx, parsed.String())
+	case "http", "https":
+		interval := time.Duration(cfg.MetadataPollInterval) * time.Second
+		if interval <= 0 {
+			interval = 5 * time.Second
+		}
+		startMetadataHTTPLoop(ctx, parsed.String(), interval)
+	default:
+		cancel()
+		return fmt.Errorf("unsupported metadata url scheme: %s", parsed.Scheme)
+	}
+
+	metadataWG.Add(1)
+	go metadataSplitLoop(ctx, cfg)
+
+	return nil
+}
+
+func startMetadataWebsocketLoop(ctx context.Context, target string) {
 	metadataWG.Add(1)
 	go func(target string) {
 		defer metadataWG.Done()
@@ -804,10 +831,67 @@ func startMetadataCollector(rawURL string, cfg Config) error {
 			case <-time.After(backoff):
 			}
 		}
-	}(parsed.String())
+	}(target)
+}
 
+func startMetadataHTTPLoop(ctx context.Context, target string, interval time.Duration) {
 	metadataWG.Add(1)
-	go metadataSplitLoop(ctx, cfg)
+	go func() {
+		defer metadataWG.Done()
+
+		if interval <= 0 {
+			interval = 5 * time.Second
+		}
+
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		client := &http.Client{
+			Timeout:   10 * time.Second,
+			Transport: &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12}},
+		}
+
+		for {
+			if err := fetchHTTPMetadata(ctx, client, target); err != nil {
+				log.Printf("Metadata HTTP poll failed: %v", err)
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+}
+
+func fetchHTTPMetadata(ctx context.Context, client *http.Client, target string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return fmt.Errorf("unable to build metadata request: %w", err)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("metadata request failed for %s: %w", redactCredentials(target), err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("metadata endpoint returned %s", resp.Status)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("unable to read metadata response: %w", err)
+	}
+
+	meta, parseErr := parseProScanMetadata(string(body))
+	if parseErr != nil {
+		return parseErr
+	}
+
+	metadataTracker.Update(meta)
 
 	return nil
 }
@@ -842,6 +926,64 @@ func parseMetadataMessage(msg string) (StreamMetadata, bool) {
 		NormalizedTag: normalizeTransmissionLabel(selected),
 		ReceivedAt:    time.Now(),
 	}, true
+}
+
+func parseProScanMetadata(body string) (StreamMetadata, error) {
+	rawTags := map[string]string{}
+
+	lookup := map[string]string{
+		"param_span8":  "listeners",
+		"param_span9":  "peak_listeners",
+		"param_span13": "scanner_type",
+		"param_span14": "scanner_activity",
+		"param_span15": "frequency",
+		"param_span16": "tone",
+		"param_span17": "talkgroup",
+		"param_span18": "system",
+		"param_span19": "group",
+		"param_span20": "channel",
+		"param_span22": "metadata",
+	}
+
+	for spanID, key := range lookup {
+		if value := extractSpanValue(body, spanID); value != "" {
+			rawTags[key] = value
+		}
+	}
+
+	if len(rawTags) == 0 {
+		return StreamMetadata{}, fmt.Errorf("metadata page did not include expected span values")
+	}
+
+	selected := firstNonEmpty(
+		rawTags["metadata"],
+		rawTags["channel"],
+		rawTags["talkgroup"],
+		rawTags["group"],
+		rawTags["system"],
+		rawTags["frequency"],
+	)
+
+	meta := StreamMetadata{
+		RawTags:       rawTags,
+		SelectedTag:   strings.TrimSpace(selected),
+		NormalizedTag: normalizeTransmissionLabel(selected),
+		ReceivedAt:    time.Now(),
+	}
+
+	return meta, nil
+}
+
+func extractSpanValue(body, id string) string {
+	pattern := fmt.Sprintf(`<span[^>]+id=['"]%s['"][^>]*>([^<]*)</span>`, regexp.QuoteMeta(id))
+	re := regexp.MustCompile(pattern)
+
+	matches := re.FindStringSubmatch(body)
+	if len(matches) < 2 {
+		return ""
+	}
+
+	return strings.TrimSpace(matches[1])
 }
 
 func metadataSplitLoop(ctx context.Context, cfg Config) {
@@ -1874,6 +2016,9 @@ func mergeConfig(current, incoming Config) Config {
 	if incoming.MetadataWebsocketURL != "" {
 		current.MetadataWebsocketURL = incoming.MetadataWebsocketURL
 	}
+	if incoming.MetadataPollInterval > 0 {
+		current.MetadataPollInterval = incoming.MetadataPollInterval
+	}
 	if incoming.DatabasePath != "" {
 		current.DatabasePath = incoming.DatabasePath
 	}
@@ -1960,6 +2105,9 @@ func validateConfig(cfg Config) error {
 	}
 	if cfg.MetadataSplitTimeout <= 0 {
 		return fmt.Errorf("metadata split timeout seconds must be positive")
+	}
+	if cfg.MetadataPollInterval <= 0 {
+		return fmt.Errorf("metadata poll interval seconds must be positive")
 	}
 	if trimmed := strings.TrimSpace(cfg.MetadataWebsocketURL); trimmed != "" {
 		if _, err := url.Parse(trimmed); err != nil {
