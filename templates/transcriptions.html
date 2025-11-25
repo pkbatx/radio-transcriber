@@ -199,6 +199,24 @@
             gap: 12px 16px;
         }
 
+        .checkbox-group {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 8px 12px;
+        }
+
+        .checkbox {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 14px;
+            color: var(--text);
+        }
+
+        .checkbox input {
+            width: auto;
+        }
+
         .field {
             display: flex;
             flex-direction: column;
@@ -327,6 +345,23 @@
                         <input id="groupmeMessageSuffix" name="groupmeMessageSuffix" placeholder=" - https://example.com" />
                     </div>
                     <div class="field" style="grid-column: span 2;">
+                        <label>Notification options</label>
+                        <div class="checkbox-group">
+                            <label class="checkbox">
+                                <input type="checkbox" id="sendUploadNotification" name="sendUploadNotification" checked />
+                                Send upload notifications
+                            </label>
+                            <label class="checkbox">
+                                <input type="checkbox" id="sendTranscription" name="sendTranscription" checked />
+                                Send transcription messages
+                            </label>
+                            <label class="checkbox">
+                                <input type="checkbox" id="includeAudioLink" name="includeAudioLink" checked />
+                                Include audio link in messages
+                            </label>
+                        </div>
+                    </div>
+                    <div class="field" style="grid-column: span 2;">
                         <label for="channels">Channels (JSON array)</label>
                         <textarea id="channels" name="channels" placeholder='[{"name":"Fire","botId":"abc","webhookUrl":"https://api.groupme.com/v3/bots/post","messageSuffix":"https://calls.example.com/","sendUploadNotification":true,"sendTranscription":true,"includeAudioLink":true}]' rows="6"></textarea>
                         <small style="color: var(--muted); display: block; margin-top: 6px;">Configure per-channel delivery for uploads and transcriptions.</small>
@@ -342,6 +377,24 @@
                     <div class="field">
                         <label for="webServerPort">Web server port</label>
                         <input id="webServerPort" name="webServerPort" placeholder="8080" />
+                    </div>
+                    <div class="field" style="grid-column: span 2;">
+                        <label class="checkbox" style="margin-top: 4px;">
+                            <input type="checkbox" id="ftpEnabled" name="ftpEnabled" />
+                            Enable built-in FTP drop server (uploads land in the watch directory)
+                        </label>
+                    </div>
+                    <div class="field">
+                        <label for="ftpPort">FTP port</label>
+                        <input id="ftpPort" name="ftpPort" placeholder="2121" />
+                    </div>
+                    <div class="field">
+                        <label for="ftpUser">FTP username (leave blank for anonymous)</label>
+                        <input id="ftpUser" name="ftpUser" placeholder="ftpuser" />
+                    </div>
+                    <div class="field">
+                        <label for="ftpPassword">FTP password</label>
+                        <input id="ftpPassword" name="ftpPassword" type="password" autocomplete="off" placeholder="optional" />
                     </div>
                     <div class="form-footer" style="grid-column: 1 / -1;">
                         <button type="button" class="secondary-btn" id="reset-config">Reset form</button>
@@ -418,11 +471,24 @@
         const chipTotal = document.getElementById('chip-total');
         const transcriptionModelSelect = document.getElementById('openaiTranscriptionModel');
         const transcriptionModelCustom = document.getElementById('openaiTranscriptionModelCustom');
+        const sendUploadNotificationInput = document.getElementById('sendUploadNotification');
+        const sendTranscriptionInput = document.getElementById('sendTranscription');
+        const includeAudioLinkInput = document.getElementById('includeAudioLink');
+        const ftpEnabledInput = document.getElementById('ftpEnabled');
         const transcriptionModels = [
             'gpt-4o-transcribe',
             'gpt-4o-mini-transcribe',
             'whisper-1',
         ];
+
+        function setFtpInputsDisabled(disabled) {
+            ['ftpPort', 'ftpUser', 'ftpPassword'].forEach((id) => {
+                const input = document.getElementById(id);
+                if (input) {
+                    input.disabled = disabled;
+                }
+            });
+        }
 
         function setStatus(message, type = '') {
             statusEl.textContent = message;
@@ -471,7 +537,7 @@
                 if (!response.ok) throw new Error('Failed to load configuration');
                 const cfg = await response.json();
 
-                const fields = ['environment', 'uploadDir', 'streamDir', 'openaiApiKey', 'groupmeBotId', 'groupmeWebhookUrl', 'discordWebhookUrl', 'genericWebhookUrl', 'processingDelay', 'streamProcessingDelay', 'maxMessageLength', 'webServerPort', 'openaiModel', 'groupmeMessageSuffix', 'streamUrl', 'streamSegmentSeconds'];
+                const fields = ['environment', 'uploadDir', 'streamDir', 'openaiApiKey', 'groupmeBotId', 'groupmeWebhookUrl', 'discordWebhookUrl', 'genericWebhookUrl', 'processingDelay', 'streamProcessingDelay', 'maxMessageLength', 'webServerPort', 'openaiModel', 'groupmeMessageSuffix', 'streamUrl', 'streamSegmentSeconds', 'ftpPort', 'ftpUser', 'ftpPassword'];
                 fields.forEach((field) => {
                         const input = document.getElementById(field);
                         if (!input) return;
@@ -481,6 +547,20 @@
                         input.value = cfg[field] || '';
                     }
                 });
+
+                if (sendUploadNotificationInput) {
+                    sendUploadNotificationInput.checked = cfg.sendUploadNotification !== false;
+                }
+                if (sendTranscriptionInput) {
+                    sendTranscriptionInput.checked = cfg.sendTranscription !== false;
+                }
+                if (includeAudioLinkInput) {
+                    includeAudioLinkInput.checked = cfg.includeAudioLink !== false;
+                }
+                if (ftpEnabledInput) {
+                    ftpEnabledInput.checked = Boolean(cfg.ftpEnabled);
+                    setFtpInputsDisabled(!ftpEnabledInput.checked);
+                }
 
                 const channelsInput = document.getElementById('channels');
                 if (channelsInput) {
@@ -533,6 +613,9 @@
                 groupmeWebhookUrl: document.getElementById('groupmeWebhookUrl').value,
                 discordWebhookUrl: document.getElementById('discordWebhookUrl').value,
                 genericWebhookUrl: document.getElementById('genericWebhookUrl').value,
+                sendUploadNotification: sendUploadNotificationInput?.checked ?? true,
+                sendTranscription: sendTranscriptionInput?.checked ?? true,
+                includeAudioLink: includeAudioLinkInput?.checked ?? true,
                 processingDelay: Number(document.getElementById('processingDelay').value),
                 streamProcessingDelay: Number(document.getElementById('streamProcessingDelay').value),
                 maxMessageLength: Number(document.getElementById('maxMessageLength').value),
@@ -543,6 +626,10 @@
                 channels,
                 streamUrl: document.getElementById('streamUrl').value,
                 streamSegmentSeconds: Number(document.getElementById('streamSegmentSeconds').value),
+                ftpEnabled: ftpEnabledInput?.checked ?? false,
+                ftpPort: document.getElementById('ftpPort').value,
+                ftpUser: document.getElementById('ftpUser').value,
+                ftpPassword: document.getElementById('ftpPassword').value,
             };
 
             try {
@@ -569,6 +656,10 @@
         document.getElementById('reset-config')?.addEventListener('click', () => {
             loadConfig();
             setStatus('Form reset to current configuration', 'note');
+        });
+
+        ftpEnabledInput?.addEventListener('change', () => {
+            setFtpInputsDisabled(!ftpEnabledInput.checked);
         });
 
         searchInput?.addEventListener('input', () => {
