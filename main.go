@@ -85,10 +85,14 @@ type Config struct {
 	Channels               []ChannelConfig `json:"channels"`
 	StreamURL              string          `json:"streamUrl"`
 	StreamSegmentSeconds   int             `json:"streamSegmentSeconds"`
+	SilenceSplitSeconds    int             `json:"silenceSplitSeconds"`
+	SilenceLookbackSeconds int             `json:"silenceLookbackSeconds"`
+	MetadataSplitTimeout   int             `json:"metadataSplitTimeoutSeconds"`
 	FTPEnabled             bool            `json:"ftpEnabled"`
 	FTPPort                string          `json:"ftpPort"`
 	FTPUser                string          `json:"ftpUser"`
 	FTPPassword            string          `json:"ftpPassword"`
+	PreferredNoiseFilter   string          `json:"preferredNoiseFilter"`
 }
 
 type StreamMetadata struct {
@@ -112,6 +116,11 @@ func (m *MetadataTracker) Update(meta StreamMetadata) {
 
 	m.last = meta
 	m.ready = true
+
+	select {
+	case metadataUpdates <- meta:
+	default:
+	}
 }
 
 func (m *MetadataTracker) Current(maxAge time.Duration) StreamMetadata {
@@ -150,9 +159,17 @@ var (
 	metadataCancel      context.CancelFunc
 	metadataWG          sync.WaitGroup
 	metadataTracker     = &MetadataTracker{}
+	metadataUpdates     = make(chan StreamMetadata, 50)
 	dbConn              *sql.DB
 	dbMux               sync.RWMutex
 )
+
+var defaultNoiseFilters = map[string]string{
+	"narrowband":         "highpass=f=300, lowpass=f=3400",
+	"hiss_reduction":     "highpass=f=280, lowpass=f=3200, afftdn=nf=-25",
+	"aggressive_cleanup": "highpass=f=250, lowpass=f=3000, anlmdn=s=2:p=0.003, afftdn=nf=-30",
+	"speech_boost":       "highpass=f=200, lowpass=f=3200, compand=attacks=0.3:decays=0.8:points=-80/-115|-60/-70|-20/-20|0/0",
+}
 
 func init() {
 	if err := godotenv.Load(); err != nil {
@@ -179,6 +196,9 @@ func loadConfig() Config {
 		GroupmeMessageSuffix:   " - https://calls.sussexcountyalerts.com/",
 		OpenAITranscription:    "gpt-4o-mini-transcribe",
 		StreamSegmentSeconds:   60,
+		SilenceSplitSeconds:    3,
+		SilenceLookbackSeconds: 8,
+		MetadataSplitTimeout:   45,
 		FTPPort:                "2121",
 	}
 
@@ -712,7 +732,7 @@ func deriveMetadataWebsocketURL(cfg Config) string {
 	return parsed.String()
 }
 
-func startMetadataCollector(rawURL string) error {
+func startMetadataCollector(rawURL string, cfg Config) error {
 	if metadataCancel != nil {
 		metadataCancel()
 		metadataWG.Wait()
@@ -786,6 +806,9 @@ func startMetadataCollector(rawURL string) error {
 		}
 	}(parsed.String())
 
+	metadataWG.Add(1)
+	go metadataSplitLoop(ctx, cfg)
+
 	return nil
 }
 
@@ -821,6 +844,44 @@ func parseMetadataMessage(msg string) (StreamMetadata, bool) {
 	}, true
 }
 
+func metadataSplitLoop(ctx context.Context, cfg Config) {
+	defer metadataWG.Done()
+
+	var lastLabel string
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case meta := <-metadataUpdates:
+			normalized := strings.TrimSpace(meta.NormalizedTag)
+			if normalized == "" {
+				continue
+			}
+
+			if lastLabel == "" {
+				lastLabel = normalized
+				continue
+			}
+
+			if normalized == lastLabel {
+				continue
+			}
+
+			lastLabel = normalized
+			currentCfg := getConfig()
+			if currentCfg.MetadataSplitTimeout <= 0 {
+				currentCfg.MetadataSplitTimeout = cfg.MetadataSplitTimeout
+			}
+			timeout := time.Duration(currentCfg.MetadataSplitTimeout) * time.Second
+
+			if err := waitForSilenceAndSplit(ctx, currentCfg, timeout); err != nil {
+				log.Printf("Metadata-based split failed: %v", err)
+			}
+		}
+	}
+}
+
 func mergeStreamMetadata(primary, fallback StreamMetadata) StreamMetadata {
 	result := primary
 
@@ -841,6 +902,117 @@ func mergeStreamMetadata(primary, fallback StreamMetadata) StreamMetadata {
 	}
 
 	return result
+}
+
+func latestStreamFile(dir string) (string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", err
+	}
+
+	var newest string
+	var newestMod time.Time
+
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".mp3") {
+			continue
+		}
+
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+
+		if newest == "" || info.ModTime().After(newestMod) {
+			newest = filepath.Join(dir, entry.Name())
+			newestMod = info.ModTime()
+		}
+	}
+
+	return newest, nil
+}
+
+func hasRecentSilence(filePath string, lookbackSeconds int, requiredSilenceSeconds int) (bool, error) {
+	if lookbackSeconds <= 0 {
+		lookbackSeconds = 8
+	}
+	if requiredSilenceSeconds <= 0 {
+		requiredSilenceSeconds = 3
+	}
+
+	args := []string{
+		"-sseof", fmt.Sprintf("-%d", lookbackSeconds),
+		"-i", filePath,
+		"-af", fmt.Sprintf("silencedetect=n=-45dB:d=%d", requiredSilenceSeconds),
+		"-f", "null", "-",
+	}
+
+	cmd := exec.Command("ffmpeg", args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil && len(output) == 0 {
+		return false, fmt.Errorf("ffmpeg silencedetect failed: %w", err)
+	}
+
+	re := regexp.MustCompile(`silence_duration:\s*([0-9.]+)`)
+	matches := re.FindAllStringSubmatch(string(output), -1)
+	for _, match := range matches {
+		if len(match) < 2 {
+			continue
+		}
+
+		duration, parseErr := strconv.ParseFloat(match[1], 64)
+		if parseErr != nil {
+			continue
+		}
+
+		if duration >= float64(requiredSilenceSeconds) {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+func restartStreamRecorder(cfg Config) error {
+	return startStreamRecorder(cfg.StreamURL, cfg.StreamDir, cfg.StreamSegmentSeconds)
+}
+
+func waitForSilenceAndSplit(ctx context.Context, cfg Config, timeout time.Duration) error {
+	streamDir := cfg.StreamDir
+	if strings.TrimSpace(streamDir) == "" {
+		return fmt.Errorf("stream directory is required for metadata-based splitting")
+	}
+
+	deadline := time.Now().Add(timeout)
+	for ctx.Err() == nil && time.Now().Before(deadline) {
+		latest, err := latestStreamFile(streamDir)
+		if err != nil {
+			return err
+		}
+
+		if latest != "" {
+			silent, err := hasRecentSilence(latest, cfg.SilenceLookbackSeconds, cfg.SilenceSplitSeconds)
+			if err != nil {
+				log.Printf("Silence detection error for %s: %v", filepath.Base(latest), err)
+			} else if silent {
+				log.Printf("Recent silence detected in %s; rotating stream after metadata change", filepath.Base(latest))
+				return restartStreamRecorder(cfg)
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(3 * time.Second):
+		}
+	}
+
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	log.Printf("Timeout waiting for silence; forcing stream split")
+	return restartStreamRecorder(cfg)
 }
 
 func main() {
@@ -878,7 +1050,7 @@ func main() {
 	}
 
 	metadataURL := deriveMetadataWebsocketURL(cfg)
-	if err := startMetadataCollector(metadataURL); err != nil {
+	if err := startMetadataCollector(metadataURL, cfg); err != nil {
 		log.Fatalf("Error starting metadata listener: %v", err)
 	}
 
@@ -1244,13 +1416,31 @@ func preprocessAudio(inputFilePath string) (string, error) {
 	tempDir := os.TempDir()
 	outputFilePath := filepath.Join(tempDir, filepath.Base(inputFilePath)+".filtered.mp3")
 
-	cmd := exec.Command("ffmpeg", "-y", "-i", inputFilePath, "-af", "highpass=f=300, lowpass=f=3400", outputFilePath)
+	filterChain := resolveNoiseFilter(getConfig())
+	log.Printf("Applying noise filter chain '%s' for %s", filterChain, filepath.Base(inputFilePath))
+	cmd := exec.Command("ffmpeg", "-y", "-i", inputFilePath, "-af", filterChain, outputFilePath)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("ffmpeg error: %s", string(output))
 	}
 
 	return outputFilePath, nil
+}
+
+func resolveNoiseFilter(cfg Config) string {
+	selected := strings.TrimSpace(cfg.PreferredNoiseFilter)
+	if selected == "" {
+		if chain, ok := defaultNoiseFilters["narrowband"]; ok {
+			return chain
+		}
+		return "highpass=f=300, lowpass=f=3400"
+	}
+
+	if chain, ok := defaultNoiseFilters[strings.ToLower(selected)]; ok {
+		return chain
+	}
+
+	return selected
 }
 
 func waitForStableFile(path string, attempts int, delay time.Duration) error {
@@ -1587,8 +1777,8 @@ func configAPIHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		if previous.MetadataWebsocketURL != updated.MetadataWebsocketURL || previous.StreamURL != updated.StreamURL {
-			if err := startMetadataCollector(deriveMetadataWebsocketURL(updated)); err != nil {
+		if previous.MetadataWebsocketURL != updated.MetadataWebsocketURL || previous.StreamURL != updated.StreamURL || previous.StreamDir != updated.StreamDir || previous.SilenceSplitSeconds != updated.SilenceSplitSeconds || previous.SilenceLookbackSeconds != updated.SilenceLookbackSeconds || previous.MetadataSplitTimeout != updated.MetadataSplitTimeout {
+			if err := startMetadataCollector(deriveMetadataWebsocketURL(updated), updated); err != nil {
 				http.Error(w, "Failed to restart metadata listener", http.StatusInternalServerError)
 				return
 			}
@@ -1690,6 +1880,18 @@ func mergeConfig(current, incoming Config) Config {
 	if incoming.StreamProcessingDelay > 0 {
 		current.StreamProcessingDelay = incoming.StreamProcessingDelay
 	}
+	if incoming.SilenceSplitSeconds > 0 {
+		current.SilenceSplitSeconds = incoming.SilenceSplitSeconds
+	}
+	if incoming.SilenceLookbackSeconds > 0 {
+		current.SilenceLookbackSeconds = incoming.SilenceLookbackSeconds
+	}
+	if incoming.MetadataSplitTimeout > 0 {
+		current.MetadataSplitTimeout = incoming.MetadataSplitTimeout
+	}
+	if incoming.PreferredNoiseFilter != "" {
+		current.PreferredNoiseFilter = incoming.PreferredNoiseFilter
+	}
 	current.FTPEnabled = incoming.FTPEnabled
 	if incoming.FTPPort != "" {
 		current.FTPPort = incoming.FTPPort
@@ -1703,6 +1905,15 @@ func mergeConfig(current, incoming Config) Config {
 	}
 	if current.StreamDir == "" {
 		current.StreamDir = filepath.Join(current.UploadDir, "stream_segments")
+	}
+	if current.SilenceSplitSeconds <= 0 {
+		current.SilenceSplitSeconds = 3
+	}
+	if current.SilenceLookbackSeconds <= 0 {
+		current.SilenceLookbackSeconds = 8
+	}
+	if current.MetadataSplitTimeout <= 0 {
+		current.MetadataSplitTimeout = 45
 	}
 	if strings.TrimSpace(current.FTPPort) == "" {
 		current.FTPPort = "2121"
@@ -1740,6 +1951,15 @@ func validateConfig(cfg Config) error {
 	}
 	if strings.TrimSpace(cfg.StreamURL) != "" && cfg.StreamSegmentSeconds <= 0 {
 		return fmt.Errorf("stream segment seconds must be positive when stream URL is set")
+	}
+	if cfg.SilenceSplitSeconds <= 0 {
+		return fmt.Errorf("silence split seconds must be positive")
+	}
+	if cfg.SilenceLookbackSeconds <= 0 {
+		return fmt.Errorf("silence lookback seconds must be positive")
+	}
+	if cfg.MetadataSplitTimeout <= 0 {
+		return fmt.Errorf("metadata split timeout seconds must be positive")
 	}
 	if trimmed := strings.TrimSpace(cfg.MetadataWebsocketURL); trimmed != "" {
 		if _, err := url.Parse(trimmed); err != nil {
