@@ -290,57 +290,61 @@
             </div>
             <div class="meta">
                 <span class="chip" id="chip-upload">Uploads: {{.UploadDir}}</span>
-                <span class="chip" id="chip-stream">Stream: {{.StreamDir}}</span>
                 <span class="chip" id="chip-total">Entries: {{.Total}}</span>
                 <span class="chip">Updated: {{if .LastUpdated.IsZero}}Pending{{else}}{{.LastUpdated.Format "2006-01-02 15:04:05 MST"}}{{end}}</span>
             </div>
         </div>
 
         <section class="grid">
-            <section class="panel" aria-label="Live stream timing">
-                <div class="controls" style="justify-content: space-between; align-items: flex-start;">
-                    <div>
-                        <h2 style="margin: 0; font-size: 18px;">Live stream cadence</h2>
-                        <p class="helper-text">Segment length and processing wait for the Icecast feed are tracked separately so uploads stay instant.</p>
-                    </div>
-                </div>
-                <div class="chip-row" aria-live="polite">
-                    <span class="chip" id="chip-segment-length">Segment length: pending</span>
-                    <span class="chip" id="chip-stream-delay">Stream wait: pending</span>
-                    <span class="chip" id="chip-metadata-poll">Metadata poll: pending</span>
-                </div>
-            </section>
 
             <section class="panel">
                 <div class="controls">
-                    <h2 style="margin: 0; font-size: 18px;">Configuration</h2>
+                    <div>
+                        <h2 style="margin: 0; font-size: 18px;">Configuration</h2>
+                        <p class="helper-text">Set it once and forget it. The form focuses on the essentials for watching your folder and sending clean notifications.</p>
+                    </div>
                     <span class="chip" title="Changing the port is saved for the next launch">Port applies after restart</span>
                 </div>
 
                 <form id="config-form" class="form-grid">
-                    <div class="section-title" style="grid-column: 1 / -1;">Uploads & notifications</div>
-                    <div class="helper-text" style="grid-column: 1 / -1;">Upload automation stays immediate. Live stream timing is tuned separately below.</div>
-                    <div class="field">
-                        <label for="environment">Environment</label>
-                        <input id="environment" name="environment" placeholder="dev / prod" />
-                    </div>
+                    <div class="section-title" style="grid-column: 1 / -1;">Basics</div>
+                    <div class="helper-text" style="grid-column: 1 / -1;">Point the app at the folder where new MP3s arrive and choose how they should be processed.</div>
                     <div class="field">
                         <label for="uploadDir">Upload watch directory</label>
                         <input id="uploadDir" name="uploadDir" placeholder="./watched_directory" required />
+                    </div>
+                    <div class="field">
+                        <label for="environment">Environment label</label>
+                        <input id="environment" name="environment" placeholder="dev / prod" />
+                    </div>
+                    <div class="field">
+                        <label for="webServerPort">Web server port</label>
+                        <input id="webServerPort" name="webServerPort" placeholder="8080" />
                     </div>
                     <div class="field">
                         <label for="openaiApiKey">OpenAI API key</label>
                         <input id="openaiApiKey" name="openaiApiKey" type="password" autocomplete="off" placeholder="sk-..." />
                     </div>
                     <div class="field">
-                        <label for="openaiModel">OpenAI model</label>
-                        <input id="openaiModel" name="openaiModel" placeholder="gpt-4o" />
-                    </div>
-                    <div class="field">
                         <label for="openaiTranscriptionModel">Transcription model</label>
                         <select id="openaiTranscriptionModel" name="openaiTranscriptionModel"></select>
                         <input id="openaiTranscriptionModelCustom" name="openaiTranscriptionModelCustom" placeholder="Custom model name" style="margin-top: 6px; display: none;" />
-                        <small style="color: var(--muted); display: block; margin-top: 6px;">Choose an OpenAI Whisper/Whisper-like model or specify a custom model.</small>
+                        <small style="color: var(--muted); display: block; margin-top: 6px;">Pick an OpenAI model or type your own.</small>
+                    </div>
+                    <div class="field">
+                        <label for="openaiModel">Completion model</label>
+                        <input id="openaiModel" name="openaiModel" placeholder="gpt-4o" />
+                    </div>
+                    <div class="field">
+                        <label for="preferredNoiseFilter">Noise filter</label>
+                        <select id="preferredNoiseFilter" name="preferredNoiseFilter">
+                            <option value="">Automatic (recommended)</option>
+                            <option value="narrowband">Radio voice - clean & bright</option>
+                            <option value="hiss_reduction">Hiss reduction</option>
+                            <option value="aggressive_cleanup">Aggressive cleanup</option>
+                            <option value="speech_boost">Speech boost</option>
+                        </select>
+                        <small style="color: var(--muted); display: block; margin-top: 6px;">Choose the filter that sounds best for your feed.</small>
                     </div>
                     <div class="field">
                         <label for="processingDelay">Processing delay (seconds)</label>
@@ -349,6 +353,26 @@
                     <div class="field">
                         <label for="maxMessageLength">Max message length</label>
                         <input id="maxMessageLength" name="maxMessageLength" type="number" min="1" step="1" />
+                    </div>
+
+                    <div class="section-title" style="grid-column: 1 / -1;">Notifications</div>
+                    <div class="helper-text" style="grid-column: 1 / -1;">Turn on the messages you want and where they should go.</div>
+                    <div class="field" style="grid-column: span 2;">
+                        <label>What to send</label>
+                        <div class="checkbox-group">
+                            <label class="checkbox">
+                                <input type="checkbox" id="sendUploadNotification" name="sendUploadNotification" checked />
+                                Alert me when a file arrives
+                            </label>
+                            <label class="checkbox">
+                                <input type="checkbox" id="sendTranscription" name="sendTranscription" checked />
+                                Post the transcription text
+                            </label>
+                            <label class="checkbox">
+                                <input type="checkbox" id="includeAudioLink" name="includeAudioLink" checked />
+                                Add a link back to the audio
+                            </label>
+                        </div>
                     </div>
                     <div class="field">
                         <label for="groupmeBotId">GroupMe Bot ID</label>
@@ -367,74 +391,25 @@
                         <input id="genericWebhookUrl" name="genericWebhookUrl" placeholder="https://example.com/webhook" />
                     </div>
                     <div class="field">
-                        <label for="groupmeMessageSuffix">Message suffix</label>
-                        <input id="groupmeMessageSuffix" name="groupmeMessageSuffix" placeholder=" - https://example.com" />
+                        <label for="groupmeMessageSuffix">Message link prefix</label>
+                        <input id="groupmeMessageSuffix" name="groupmeMessageSuffix" placeholder="https://example.com/audio/" />
                     </div>
                     <div class="field" style="grid-column: span 2;">
-                        <label>Notification options</label>
-                        <div class="checkbox-group">
-                            <label class="checkbox">
-                                <input type="checkbox" id="sendUploadNotification" name="sendUploadNotification" checked />
-                                Send upload notifications
-                            </label>
-                            <label class="checkbox">
-                                <input type="checkbox" id="sendTranscription" name="sendTranscription" checked />
-                                Send transcription messages
-                            </label>
-                            <label class="checkbox">
-                                <input type="checkbox" id="includeAudioLink" name="includeAudioLink" checked />
-                                Include audio link in messages
-                            </label>
-                        </div>
+                        <label for="channels">Custom channels (JSON array)</label>
+                        <textarea id="channels" name="channels" placeholder='[{"name":"Fire","botId":"abc","webhookUrl":"https://api.groupme.com/v3/bots/post","messageSuffix":"https://calls.example.com/","sendUploadNotification":true,"sendTranscription":true,"includeAudioLink":true}]' rows="5"></textarea>
+                        <small style="color: var(--muted); display: block; margin-top: 6px;">Optional: advanced per-channel settings.</small>
                     </div>
-                    <div class="field" style="grid-column: span 2;">
-                        <label for="channels">Channels (JSON array)</label>
-                        <textarea id="channels" name="channels" placeholder='[{"name":"Fire","botId":"abc","webhookUrl":"https://api.groupme.com/v3/bots/post","messageSuffix":"https://calls.example.com/","sendUploadNotification":true,"sendTranscription":true,"includeAudioLink":true}]' rows="6"></textarea>
-                        <small style="color: var(--muted); display: block; margin-top: 6px;">Configure per-channel delivery for uploads and transcriptions.</small>
-                    </div>
-                    <div class="section-title" style="grid-column: 1 / -1;">Live stream ingest (Icecast)</div>
-                    <div class="helper-text" style="grid-column: 1 / -1;">Segment length and the stream-only processing delay are isolated from upload handling.</div>
-                    <div class="field">
-                        <label for="streamDir">Stream watch directory</label>
-                        <input id="streamDir" name="streamDir" placeholder="./stream_segments" required />
-                    </div>
-                    <div class="field">
-                        <label for="streamProcessingDelay">Stream processing delay (seconds)</label>
-                        <input id="streamProcessingDelay" name="streamProcessingDelay" type="number" min="0" step="1" />
-                        <small style="color: var(--muted); display: block; margin-top: 6px;">Wait time before processing stream segments so recordings finish writing; upload processing stays immediate.</small>
-                    </div>
-                    <div class="field">
-                        <label for="streamUrl">Icecast stream URL</label>
-                        <input id="streamUrl" name="streamUrl" placeholder="http://example.com:8000/stream" />
-                    </div>
-                    <div class="field">
-                        <label for="streamSegmentSeconds">Stream segment seconds</label>
-                        <input id="streamSegmentSeconds" name="streamSegmentSeconds" type="number" min="5" step="1" />
-                        <small style="color: var(--muted); display: block; margin-top: 6px;">How long each live segment runs before being closed and transcribed.</small>
-                    </div>
-                    <div class="field">
-                        <label for="metadataWebsocketUrl">Metadata source URL</label>
-                        <input id="metadataWebsocketUrl" name="metadataWebsocketUrl" placeholder="https://example.com/?all or wss://example.com/" />
-                        <small style="color: var(--muted); display: block; margin-top: 6px;">Supports WebSocket endpoints or ProScan /?all pages; HTTP sources are polled automatically.</small>
-                    </div>
-                    <div class="field">
-                        <label for="metadataPollIntervalSeconds">Metadata poll interval (seconds)</label>
-                        <input id="metadataPollIntervalSeconds" name="metadataPollIntervalSeconds" type="number" min="1" step="1" />
-                        <small style="color: var(--muted); display: block; margin-top: 6px;">Used for HTTP/HTTPS metadata pages; WebSocket feeds ignore this value.</small>
-                    </div>
+
+                    <div class="section-title" style="grid-column: 1 / -1;">Access & storage</div>
+                    <div class="helper-text" style="grid-column: 1 / -1;">Keep the server reachable and optionally expose a simple FTP drop.</div>
                     <div class="field">
                         <label for="databasePath">Database path</label>
                         <input id="databasePath" name="databasePath" placeholder="transcriptions.db" />
-                        <small style="color: var(--muted); display: block; margin-top: 6px;">Lite SQL storage for recent transcriptions.</small>
-                    </div>
-                    <div class="field">
-                        <label for="webServerPort">Web server port</label>
-                        <input id="webServerPort" name="webServerPort" placeholder="8080" />
                     </div>
                     <div class="field" style="grid-column: span 2;">
                         <label class="checkbox" style="margin-top: 4px;">
                             <input type="checkbox" id="ftpEnabled" name="ftpEnabled" />
-                            Enable built-in FTP drop server (uploads land in the watch directory)
+                            Enable FTP drop server (lands files in the watch folder)
                         </label>
                     </div>
                     <div class="field">
@@ -449,14 +424,16 @@
                         <label for="ftpPassword">FTP password</label>
                         <input id="ftpPassword" name="ftpPassword" type="password" autocomplete="off" placeholder="optional" />
                     </div>
+
                     <div class="form-footer" style="grid-column: 1 / -1;">
                         <button type="button" class="secondary-btn" id="reset-config">Reset form</button>
                         <button type="submit" class="button">Save configuration</button>
                     </div>
-                    <div class="status note" id="config-note">Changes apply immediately; port updates take effect after restarting the app.</div>
+                    <div class="status note" id="config-note">Changes apply immediately.</div>
                     <div class="status" id="config-status" aria-live="polite"></div>
                 </form>
             </section>
+            
 
             <section class="panel">
                 <div class="controls">
@@ -490,17 +467,10 @@
                                 <td class="filename"><a href="https://calls.sussexcountyalerts.com/{{.FileName}}" target="_blank" rel="noopener">{{.FileName}}</a></td>
                                 <td>
                                     <div class="pill" style="margin-bottom: 6px;">{{if .Source}}{{.Source}}{{else}}UPLOAD{{end}}</div>
-                                    {{if .Metadata.NormalizedTag}}
-                                    <div class="badge">{{.Metadata.NormalizedTag}}</div>
-                                    {{else}}
-                                    <div class="badge">No stream metadata</div>
-                                    {{end}}
+                                    <div class="badge">Cleaned audio ready to share</div>
                                 </td>
                                 <td>{{.CorrectedText}}</td>
                                 <td>
-                                    {{if .Metadata.SelectedTag}}
-                                    <div class="badge">Raw tag: {{.Metadata.SelectedTag}}</div>
-                                    {{end}}
                                     <button class="copy-btn" data-text="{{.CorrectedText}}">Copy</button>
                                 </td>
                             </tr>
@@ -520,10 +490,6 @@
         const configForm = document.getElementById('config-form');
         const statusEl = document.getElementById('config-status');
         const chipUpload = document.getElementById('chip-upload');
-        const chipStream = document.getElementById('chip-stream');
-        const chipSegmentLength = document.getElementById('chip-segment-length');
-        const chipStreamDelay = document.getElementById('chip-stream-delay');
-        const chipMetadataPoll = document.getElementById('chip-metadata-poll');
         const chipTotal = document.getElementById('chip-total');
         const transcriptionModelSelect = document.getElementById('openaiTranscriptionModel');
         const transcriptionModelCustom = document.getElementById('openaiTranscriptionModelCustom');
@@ -593,7 +559,7 @@
                 if (!response.ok) throw new Error('Failed to load configuration');
                 const cfg = await response.json();
 
-                const fields = ['environment', 'uploadDir', 'streamDir', 'openaiApiKey', 'groupmeBotId', 'groupmeWebhookUrl', 'discordWebhookUrl', 'genericWebhookUrl', 'processingDelay', 'streamProcessingDelay', 'maxMessageLength', 'webServerPort', 'openaiModel', 'groupmeMessageSuffix', 'streamUrl', 'streamSegmentSeconds', 'metadataWebsocketUrl', 'metadataPollIntervalSeconds', 'databasePath', 'ftpPort', 'ftpUser', 'ftpPassword'];
+                const fields = ['environment', 'uploadDir', 'openaiApiKey', 'groupmeBotId', 'groupmeWebhookUrl', 'discordWebhookUrl', 'genericWebhookUrl', 'processingDelay', 'maxMessageLength', 'webServerPort', 'openaiModel', 'groupmeMessageSuffix', 'databasePath', 'ftpPort', 'ftpUser', 'ftpPassword', 'preferredNoiseFilter'];
                 fields.forEach((field) => {
                         const input = document.getElementById(field);
                         if (!input) return;
@@ -625,13 +591,6 @@
 
                 populateTranscriptionModels(cfg.openaiTranscriptionModel || '');
                 if (chipUpload) chipUpload.textContent = `Uploads: ${cfg.uploadDir || cfg.watchDir}`;
-                if (chipStream) chipStream.textContent = `Stream: ${cfg.streamDir}`;
-                const segmentSeconds = Number(cfg.streamSegmentSeconds) || 0;
-                const streamDelay = Number(cfg.streamProcessingDelay ?? cfg.processingDelay) || 0;
-                const metadataPoll = Number(cfg.metadataPollIntervalSeconds ?? cfg.metadataPollInterval) || 0;
-                if (chipSegmentLength) chipSegmentLength.textContent = `Segment length: ${segmentSeconds > 0 ? `${segmentSeconds}s` : 'n/a'}`;
-                if (chipStreamDelay) chipStreamDelay.textContent = `Stream wait: ${streamDelay > 0 ? `${streamDelay}s` : 'n/a'}`;
-                if (chipMetadataPoll) chipMetadataPoll.textContent = `Metadata poll: ${metadataPoll > 0 ? `${metadataPoll}s` : 'n/a'}`;
                 setStatus('', '');
             } catch (error) {
                 setStatus(error.message, 'error');
@@ -666,31 +625,26 @@
                 return;
             }
 
-                const payload = {
-                        environment: document.getElementById('environment').value,
-                        uploadDir: document.getElementById('uploadDir').value,
-                        streamDir: document.getElementById('streamDir').value,
-                        metadataWebsocketUrl: document.getElementById('metadataWebsocketUrl').value,
-                        databasePath: document.getElementById('databasePath').value,
-                        openaiApiKey: document.getElementById('openaiApiKey').value,
-                        groupmeBotId: document.getElementById('groupmeBotId').value,
-                        groupmeWebhookUrl: document.getElementById('groupmeWebhookUrl').value,
+            const payload = {
+                environment: document.getElementById('environment').value,
+                uploadDir: document.getElementById('uploadDir').value,
+                databasePath: document.getElementById('databasePath').value,
+                openaiApiKey: document.getElementById('openaiApiKey').value,
+                groupmeBotId: document.getElementById('groupmeBotId').value,
+                groupmeWebhookUrl: document.getElementById('groupmeWebhookUrl').value,
                 discordWebhookUrl: document.getElementById('discordWebhookUrl').value,
                 genericWebhookUrl: document.getElementById('genericWebhookUrl').value,
                 sendUploadNotification: sendUploadNotificationInput?.checked ?? true,
                 sendTranscription: sendTranscriptionInput?.checked ?? true,
                 includeAudioLink: includeAudioLinkInput?.checked ?? true,
                 processingDelay: Number(document.getElementById('processingDelay').value),
-                streamProcessingDelay: Number(document.getElementById('streamProcessingDelay').value),
                 maxMessageLength: Number(document.getElementById('maxMessageLength').value),
                 webServerPort: document.getElementById('webServerPort').value,
                 openaiModel: document.getElementById('openaiModel').value,
                 openaiTranscriptionModel: selectedModel,
+                preferredNoiseFilter: document.getElementById('preferredNoiseFilter').value,
                 groupmeMessageSuffix: document.getElementById('groupmeMessageSuffix').value,
                 channels,
-                streamUrl: document.getElementById('streamUrl').value,
-                streamSegmentSeconds: Number(document.getElementById('streamSegmentSeconds').value),
-                metadataPollIntervalSeconds: Number(document.getElementById('metadataPollIntervalSeconds').value),
                 ftpEnabled: ftpEnabledInput?.checked ?? false,
                 ftpPort: document.getElementById('ftpPort').value,
                 ftpUser: document.getElementById('ftpUser').value,
@@ -711,13 +665,6 @@
 
                 const updated = await response.json();
                 if (chipUpload) chipUpload.textContent = `Uploads: ${updated.uploadDir || updated.watchDir}`;
-                if (chipStream) chipStream.textContent = `Stream: ${updated.streamDir}`;
-                const updatedSegmentSeconds = Number(updated.streamSegmentSeconds) || 0;
-                const updatedStreamDelay = Number(updated.streamProcessingDelay ?? updated.processingDelay) || 0;
-                const updatedMetadataPoll = Number(updated.metadataPollIntervalSeconds ?? updated.metadataPollInterval) || 0;
-                if (chipSegmentLength) chipSegmentLength.textContent = `Segment length: ${updatedSegmentSeconds > 0 ? `${updatedSegmentSeconds}s` : 'n/a'}`;
-                if (chipStreamDelay) chipStreamDelay.textContent = `Stream wait: ${updatedStreamDelay > 0 ? `${updatedStreamDelay}s` : 'n/a'}`;
-                if (chipMetadataPoll) chipMetadataPoll.textContent = `Metadata poll: ${updatedMetadataPoll > 0 ? `${updatedMetadataPoll}s` : 'n/a'}`;
                 setStatus('Configuration saved. Watchers updated.', 'success');
             } catch (error) {
                 setStatus(error.message, 'error');
