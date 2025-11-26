@@ -51,6 +51,7 @@ type ChannelConfig struct {
 	BotID                  string `json:"botId"`
 	WebhookURL             string `json:"webhookUrl"`
 	MessageSuffix          string `json:"messageSuffix"`
+	HumanizeTranscription  bool   `json:"humanizeTranscription"`
 	SendUploadNotification bool   `json:"sendUploadNotification"`
 	SendTranscription      bool   `json:"sendTranscription"`
 	IncludeAudioLink       bool   `json:"includeAudioLink"`
@@ -74,6 +75,7 @@ type Config struct {
 	MaxMessageLength       int             `json:"maxMessageLength"`
 	WebServerPort          string          `json:"webServerPort"`
 	OpenAIModel            string          `json:"openaiModel"`
+	OpenAIHumanizeModel    string          `json:"openaiHumanizeModel"`
 	GroupmeMessageSuffix   string          `json:"groupmeMessageSuffix"`
 	OpenAITranscription    string          `json:"openaiTranscriptionModel"`
 	Channels               []ChannelConfig `json:"channels"`
@@ -136,6 +138,7 @@ func loadConfig() Config {
 		MaxMessageLength:       1000,
 		WebServerPort:          "8080",
 		OpenAIModel:            "gpt-4.1",
+		OpenAIHumanizeModel:    "gpt-4o-mini",
 		GroupmeMessageSuffix:   " - https://calls.sussexcountyalerts.com/",
 		OpenAITranscription:    "gpt-4o-mini-transcribe",
 		FTPPort:                "2121",
@@ -168,6 +171,7 @@ func loadConfig() Config {
 		}
 		cfg.WebServerPort = firstNonEmpty(os.Getenv("WEB_SERVER_PORT"), cfg.WebServerPort)
 		cfg.OpenAIModel = firstNonEmpty(os.Getenv("OPENAI_MODEL"), cfg.OpenAIModel)
+		cfg.OpenAIHumanizeModel = firstNonEmpty(os.Getenv("OPENAI_HUMANIZE_MODEL"), cfg.OpenAIHumanizeModel)
 		cfg.GroupmeMessageSuffix = firstNonEmpty(os.Getenv("GROUPME_MESSAGE_SUFFIX"), cfg.GroupmeMessageSuffix)
 	}
 
@@ -191,6 +195,9 @@ func loadConfig() Config {
 	}
 	if cfg.OpenAIModel == "" {
 		cfg.OpenAIModel = "gpt-4.1"
+	}
+	if cfg.OpenAIHumanizeModel == "" {
+		cfg.OpenAIHumanizeModel = "gpt-4o-mini"
 	}
 	if cfg.OpenAITranscription == "" {
 		cfg.OpenAITranscription = "gpt-4o-mini-transcribe"
@@ -223,6 +230,7 @@ func loadConfig() Config {
 				BotID:                  cfg.GroupmeBotID,
 				WebhookURL:             firstNonEmpty(cfg.GroupmeWebhookURL, cfg.WebhookURL),
 				MessageSuffix:          cfg.GroupmeMessageSuffix,
+				HumanizeTranscription:  false,
 				SendUploadNotification: true,
 				SendTranscription:      true,
 				IncludeAudioLink:       true,
@@ -626,10 +634,34 @@ func handleUploadFile(path string) {
 
 	cfg := getConfig()
 	corrected := strings.TrimSpace(transcription)
+	requiresHumanization := false
+	for _, channel := range cfg.Channels {
+		if channel.HumanizeTranscription {
+			requiresHumanization = true
+			break
+		}
+	}
+
+	humanized := ""
+	if requiresHumanization {
+		if rewritten, err := humanizeTranscription(corrected, metadata, cfg); err != nil {
+			log.Printf("Failed to humanize %s: %v", filepath.Base(path), err)
+		} else {
+			humanized = rewritten
+		}
+	}
+
 	message := formatMessageWithMetadata(corrected, metadata.NormalizedTag, metadata)
+	humanizedMessage := ""
+	if humanized != "" {
+		humanizedMessage = formatMessageWithMetadata(humanized, metadata.NormalizedTag, metadata)
+	}
 	messageSuffix := firstNonEmpty(cfg.GroupmeMessageSuffix)
 	if messageSuffix != "" {
 		message = strings.TrimSpace(message + " " + messageSuffix)
+		if humanizedMessage != "" {
+			humanizedMessage = strings.TrimSpace(humanizedMessage + " " + messageSuffix)
+		}
 	}
 
 	storeTranscription(filepath.Base(path), transcription, corrected, metadata.NormalizedTag, metadata)
@@ -646,6 +678,9 @@ func handleUploadFile(path string) {
 
 		if channel.SendTranscription || cfg.SendTranscription {
 			channelMessage := message
+			if channel.HumanizeTranscription && humanizedMessage != "" {
+				channelMessage = humanizedMessage
+			}
 			if suffix := strings.TrimSpace(channel.MessageSuffix); suffix != "" {
 				channelMessage = strings.TrimSpace(channelMessage + " " + suffix)
 			}
@@ -811,6 +846,100 @@ func transcribeAudio(filePath string) (string, error) {
 	log.Println("Transcription completed for:", filePath)
 
 	return transcription, nil
+}
+
+func humanizeTranscription(text string, metadata StreamMetadata, cfg Config) (string, error) {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return "", fmt.Errorf("empty transcription provided")
+	}
+
+	if cfg.OpenAIAPIKey == "" {
+		return "", fmt.Errorf("missing OpenAI API key")
+	}
+
+	model := firstNonEmpty(cfg.OpenAIHumanizeModel, cfg.OpenAIModel, "gpt-4o-mini")
+
+	metadataParts := []string{}
+	if metadata.SelectedTag != "" {
+		metadataParts = append(metadataParts, fmt.Sprintf("tagged as '%s'", metadata.SelectedTag))
+	}
+	if metadata.NormalizedTag != "" {
+		metadataParts = append(metadataParts, fmt.Sprintf("normalized tag '%s'", metadata.NormalizedTag))
+	}
+	if len(metadata.RawTags) > 0 {
+		if raw, err := json.Marshal(metadata.RawTags); err == nil {
+			metadataParts = append(metadataParts, fmt.Sprintf("raw tags %s", string(raw)))
+		}
+	}
+	if !metadata.ReceivedAt.IsZero() {
+		metadataParts = append(metadataParts, fmt.Sprintf("received at %s", metadata.ReceivedAt.UTC().Format(time.RFC3339)))
+	}
+
+	metadataContext := "No metadata provided."
+	if len(metadataParts) > 0 {
+		metadataContext = strings.Join(metadataParts, "; ")
+	}
+
+	payload := map[string]interface{}{
+		"model":       model,
+		"temperature": 0.3,
+		"messages": []map[string]string{
+			{
+				"role":    "system",
+				"content": "You rewrite terse radio dispatch transcriptions into concise, natural-sounding summaries. Blend metadata into the summary conversationally, avoid speculation, and keep responses under 4 sentences.",
+			},
+			{
+				"role":    "user",
+				"content": fmt.Sprintf("Transcription: %s\nMetadata: %s\nRewrite:", trimmed, metadataContext),
+			},
+		},
+	}
+
+	bodyBytes, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal humanize payload: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", "https://api.openai.com/v1/chat/completions", bytes.NewReader(bodyBytes))
+	if err != nil {
+		return "", fmt.Errorf("failed to build humanize request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+cfg.OpenAIAPIKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to call OpenAI humanization: %w", err)
+	}
+	defer resp.Body.Close()
+
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read humanization response: %w", err)
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("OpenAI humanization error: %s", string(responseBody))
+	}
+
+	var completion struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+
+	if err := json.Unmarshal(responseBody, &completion); err != nil {
+		return "", fmt.Errorf("failed to parse humanization response: %w", err)
+	}
+
+	if len(completion.Choices) == 0 || strings.TrimSpace(completion.Choices[0].Message.Content) == "" {
+		return "", fmt.Errorf("humanization response missing content")
+	}
+
+	return strings.TrimSpace(completion.Choices[0].Message.Content), nil
 }
 
 func preprocessAudio(inputFilePath string) (string, error) {
@@ -1262,6 +1391,9 @@ func mergeConfig(current, incoming Config) Config {
 	}
 	if incoming.OpenAIModel != "" {
 		current.OpenAIModel = incoming.OpenAIModel
+	}
+	if incoming.OpenAIHumanizeModel != "" {
+		current.OpenAIHumanizeModel = incoming.OpenAIHumanizeModel
 	}
 	if incoming.OpenAITranscription != "" {
 		current.OpenAITranscription = incoming.OpenAITranscription
