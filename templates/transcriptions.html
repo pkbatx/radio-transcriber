@@ -128,6 +128,8 @@
             gap: 16px;
         }
 
+        .stacked { display: grid; gap: 10px; }
+
         .panel {
             background: var(--panel);
             border: 1px solid var(--border);
@@ -232,6 +234,12 @@
 
         .chip-row { display: flex; flex-wrap: wrap; gap: 8px; }
         .chip { background: rgba(255, 255, 255, 0.05); border: 1px solid var(--border); padding: 8px 10px; border-radius: 10px; font-size: 13px; color: var(--muted); }
+
+        .upload-area { border: 1px dashed var(--border); border-radius: 12px; padding: 14px; background: rgba(255, 255, 255, 0.02); }
+        .preview-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-top: 12px; }
+        .preview-card { border: 1px solid var(--border); border-radius: 12px; padding: 12px; background: rgba(255, 255, 255, 0.03); box-shadow: var(--shadow); display: grid; gap: 8px; }
+        .preview-card strong { font-size: 14px; }
+        audio { width: 100%; border-radius: 10px; }
 
         @media (max-width: 900px) {
             body { padding: 18px; }
@@ -428,6 +436,46 @@
             <section class="panel">
                 <div class="panel-header">
                     <div>
+                        <h3 class="panel-title">Manual upload & previews</h3>
+                        <p class="panel-subtitle">Drop a file, choose a filter, and preview the cleaned audio instantly.</p>
+                    </div>
+                    <div class="panel-actions">
+                        <button class="ghost-btn" type="button" id="reload-config">Reload config</button>
+                    </div>
+                </div>
+
+                <form id="manual-upload-form" class="stacked upload-area">
+                    <div class="field" style="margin: 0;">
+                        <label for="manualFile">Upload audio</label>
+                        <input id="manualFile" name="file" type="file" accept="audio/*" required />
+                        <p class="helper-text">Supported: mp3, wav, m4a, aac, flac, ogg. Files are stored and analyzed right away.</p>
+                    </div>
+                    <div class="field" style="margin: 0;">
+                        <label for="manualNoiseFilter">Preview filter</label>
+                        <select id="manualNoiseFilter" name="noiseFilter">
+                            <option value="">Automatic (use config)</option>
+                            <option value="raw">Raw (no filter)</option>
+                            <option value="narrowband">Radio voice - clean & bright</option>
+                            <option value="hiss_reduction">Hiss reduction</option>
+                            <option value="aggressive_cleanup">Aggressive cleanup</option>
+                            <option value="speech_boost">Speech boost</option>
+                        </select>
+                        <p class="helper-text">Pick how you want the upload cleaned before transcribing.</p>
+                    </div>
+                    <div class="form-footer" style="padding: 0;">
+                        <div class="status" id="upload-status" aria-live="polite">No upload in progress.</div>
+                        <button type="submit" class="button">Upload & transcribe</button>
+                    </div>
+                </form>
+
+                <div class="preview-grid" id="preview-grid">
+                    <div class="empty-state" id="preview-empty">Upload a file to see raw and filtered previews.</div>
+                </div>
+            </section>
+
+            <section class="panel">
+                <div class="panel-header">
+                    <div>
                         <h3 class="panel-title">Live feed</h3>
                         <p class="panel-subtitle">Browse the latest transcriptions and copy them without extra cleanup.</p>
                     </div>
@@ -482,6 +530,12 @@
         const refresh = document.getElementById('refresh');
         const configForm = document.getElementById('config-form');
         const statusEl = document.getElementById('config-status');
+        const manualUploadForm = document.getElementById('manual-upload-form');
+        const uploadStatusEl = document.getElementById('upload-status');
+        const previewGrid = document.getElementById('preview-grid');
+        const previewEmpty = document.getElementById('preview-empty');
+        const reloadButton = document.getElementById('reload-config');
+        const manualNoiseFilter = document.getElementById('manualNoiseFilter');
         const chipUpload = document.getElementById('chip-upload');
         const chipTotal = document.getElementById('chip-total');
         const transcriptionModelSelect = document.getElementById('openaiTranscriptionModel');
@@ -494,6 +548,13 @@
             'gpt-4o-transcribe',
             'gpt-4o-mini-transcribe',
             'whisper-1',
+        ];
+        const previewFilters = [
+            { key: 'raw', label: 'Raw audio' },
+            { key: 'narrowband', label: 'Narrowband (default)' },
+            { key: 'hiss_reduction', label: 'Hiss reduction' },
+            { key: 'aggressive_cleanup', label: 'Aggressive cleanup' },
+            { key: 'speech_boost', label: 'Speech boost' },
         ];
 
         function setFtpInputsDisabled(disabled) {
@@ -508,6 +569,37 @@
         function setStatus(message, type = '') {
             statusEl.textContent = message;
             statusEl.className = `status ${type}`.trim();
+        }
+
+        function setUploadStatus(message, type = '') {
+            if (!uploadStatusEl) return;
+            uploadStatusEl.textContent = message;
+            uploadStatusEl.className = `status ${type}`.trim();
+        }
+
+        function renderPreviewGrid(fileName) {
+            if (!previewGrid) return;
+
+            previewGrid.innerHTML = '';
+            if (previewEmpty) previewEmpty.remove();
+
+            previewFilters.forEach(({ key, label }) => {
+                const card = document.createElement('div');
+                card.className = 'preview-card';
+
+                const title = document.createElement('strong');
+                title.textContent = label;
+
+                const audio = document.createElement('audio');
+                audio.controls = true;
+                const params = new URLSearchParams({ file: fileName });
+                if (key && key !== 'raw') params.set('filter', key);
+                audio.src = `/api/audio-preview?${params.toString()}`;
+
+                card.appendChild(title);
+                card.appendChild(audio);
+                previewGrid.appendChild(card);
+            });
         }
 
         function populateTranscriptionModels(selectedModel = '') {
@@ -575,6 +667,9 @@
                 if (ftpEnabledInput) {
                     ftpEnabledInput.checked = Boolean(cfg.ftpEnabled);
                     setFtpInputsDisabled(!ftpEnabledInput.checked);
+                }
+                if (manualNoiseFilter) {
+                    manualNoiseFilter.value = cfg.preferredNoiseFilter || '';
                 }
 
                 const channelsInput = document.getElementById('channels');
@@ -674,6 +769,61 @@
 
         ftpEnabledInput?.addEventListener('change', () => {
             setFtpInputsDisabled(!ftpEnabledInput.checked);
+        });
+
+        manualUploadForm?.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            const fileInput = document.getElementById('manualFile');
+            const file = fileInput?.files?.[0];
+
+            if (!file) {
+                setUploadStatus('Please choose an audio file to upload.', 'error');
+                return;
+            }
+
+            const formData = new FormData();
+            formData.append('file', file);
+            formData.append('noiseFilter', manualNoiseFilter?.value || '');
+
+            setUploadStatus('Uploading and queuing transcription...', '');
+
+            try {
+                const response = await fetch('/api/upload', {
+                    method: 'POST',
+                    body: formData,
+                });
+
+                if (!response.ok) {
+                    const text = await response.text();
+                    throw new Error(text || 'Upload failed');
+                }
+
+                const payload = await response.json();
+                setUploadStatus('Upload received. Processing now.', 'success');
+                if (payload?.fileName) {
+                    renderPreviewGrid(payload.fileName);
+                }
+            } catch (error) {
+                setUploadStatus(error.message || 'Unable to upload right now.', 'error');
+            }
+        });
+
+        reloadButton?.addEventListener('click', async () => {
+            setStatus('Reloading configuration from disk...', '');
+            try {
+                const response = await fetch('/api/reload', { method: 'POST' });
+                if (!response.ok) {
+                    const text = await response.text();
+                    throw new Error(text || 'Failed to reload configuration');
+                }
+
+                const cfg = await response.json();
+                if (chipUpload) chipUpload.textContent = `Watching: ${cfg.uploadDir || cfg.watchDir}`;
+                setStatus('Configuration reloaded. Channels refreshed.', 'success');
+                loadConfig();
+            } catch (error) {
+                setStatus(error.message || 'Unable to reload configuration.', 'error');
+            }
         });
 
         searchInput?.addEventListener('input', () => {
