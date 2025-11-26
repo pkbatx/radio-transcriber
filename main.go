@@ -57,31 +57,32 @@ type ChannelConfig struct {
 }
 
 type Config struct {
-	Environment            string          `json:"environment"`
-	WatchDir               string          `json:"watchDir"`
-	UploadDir              string          `json:"uploadDir"`
-	DatabasePath           string          `json:"databasePath"`
-	OpenAIAPIKey           string          `json:"openaiApiKey"`
-	GroupmeBotID           string          `json:"groupmeBotId"`
-	GroupmeWebhookURL      string          `json:"groupmeWebhookUrl"`
-	DiscordWebhookURL      string          `json:"discordWebhookUrl"`
-	GenericWebhookURL      string          `json:"genericWebhookUrl"`
-	WebhookURL             string          `json:"webhookUrl"`
-	SendUploadNotification bool            `json:"sendUploadNotification"`
-	SendTranscription      bool            `json:"sendTranscription"`
-	IncludeAudioLink       bool            `json:"includeAudioLink"`
-	ProcessingDelay        int             `json:"processingDelay"`
-	MaxMessageLength       int             `json:"maxMessageLength"`
-	WebServerPort          string          `json:"webServerPort"`
-	OpenAIModel            string          `json:"openaiModel"`
-	GroupmeMessageSuffix   string          `json:"groupmeMessageSuffix"`
-	OpenAITranscription    string          `json:"openaiTranscriptionModel"`
-	Channels               []ChannelConfig `json:"channels"`
-	FTPEnabled             bool            `json:"ftpEnabled"`
-	FTPPort                string          `json:"ftpPort"`
-	FTPUser                string          `json:"ftpUser"`
-	FTPPassword            string          `json:"ftpPassword"`
-	PreferredNoiseFilter   string          `json:"preferredNoiseFilter"`
+	Environment             string          `json:"environment"`
+	WatchDir                string          `json:"watchDir"`
+	UploadDir               string          `json:"uploadDir"`
+	DatabasePath            string          `json:"databasePath"`
+	OpenAIAPIKey            string          `json:"openaiApiKey"`
+	GroupmeBotID            string          `json:"groupmeBotId"`
+	GroupmeWebhookURL       string          `json:"groupmeWebhookUrl"`
+	DiscordWebhookURL       string          `json:"discordWebhookUrl"`
+	GenericWebhookURL       string          `json:"genericWebhookUrl"`
+	WebhookURL              string          `json:"webhookUrl"`
+	SendUploadNotification  bool            `json:"sendUploadNotification"`
+	SendTranscription       bool            `json:"sendTranscription"`
+	IncludeAudioLink        bool            `json:"includeAudioLink"`
+	ProcessingDelay         int             `json:"processingDelay"`
+	MaxMessageLength        int             `json:"maxMessageLength"`
+	WebServerPort           string          `json:"webServerPort"`
+	OpenAIModel             string          `json:"openaiModel"`
+	GroupmeMessageSuffix    string          `json:"groupmeMessageSuffix"`
+	OpenAITranscription     string          `json:"openaiTranscriptionModel"`
+	Channels                []ChannelConfig `json:"channels"`
+	FTPEnabled              bool            `json:"ftpEnabled"`
+	FTPPort                 string          `json:"ftpPort"`
+	FTPUser                 string          `json:"ftpUser"`
+	FTPPassword             string          `json:"ftpPassword"`
+	PreferredNoiseFilter    string          `json:"preferredNoiseFilter"`
+	ProcessedRetentionHours int             `json:"processedRetentionHours"`
 }
 
 type StreamMetadata struct {
@@ -95,8 +96,8 @@ var (
 	configFilePath      = "config.json"
 	config              Config
 	configMux           sync.RWMutex
-	processedFiles      = make(map[string]bool)
-	processedFilesMux   sync.Mutex
+	processingFiles     = make(map[string]bool)
+	processingFilesMux  sync.Mutex
 	tmpl                *template.Template
 	transcriptions      []Transcription
 	transcriptionsMux   sync.Mutex
@@ -124,21 +125,22 @@ func init() {
 
 func loadConfig() Config {
 	cfg := Config{
-		Environment:            "dev",
-		WatchDir:               "./watched_directory",
-		UploadDir:              "./watched_directory",
-		DatabasePath:           "transcriptions.db",
-		GroupmeWebhookURL:      "https://api.groupme.com/v3/bots/post",
-		SendUploadNotification: true,
-		SendTranscription:      true,
-		IncludeAudioLink:       true,
-		ProcessingDelay:        1,
-		MaxMessageLength:       1000,
-		WebServerPort:          "8080",
-		OpenAIModel:            "gpt-4.1",
-		GroupmeMessageSuffix:   " - https://calls.sussexcountyalerts.com/",
-		OpenAITranscription:    "gpt-4o-mini-transcribe",
-		FTPPort:                "2121",
+		Environment:             "dev",
+		WatchDir:                "./watched_directory",
+		UploadDir:               "./watched_directory",
+		DatabasePath:            "transcriptions.db",
+		GroupmeWebhookURL:       "https://api.groupme.com/v3/bots/post",
+		SendUploadNotification:  true,
+		SendTranscription:       true,
+		IncludeAudioLink:        true,
+		ProcessingDelay:         1,
+		MaxMessageLength:        1000,
+		WebServerPort:           "8080",
+		OpenAIModel:             "gpt-4.1",
+		GroupmeMessageSuffix:    " - https://calls.sussexcountyalerts.com/",
+		OpenAITranscription:     "gpt-4o-mini-transcribe",
+		FTPPort:                 "2121",
+		ProcessedRetentionHours: 168,
 	}
 
 	if data, err := os.ReadFile(configFilePath); err == nil {
@@ -169,6 +171,11 @@ func loadConfig() Config {
 		cfg.WebServerPort = firstNonEmpty(os.Getenv("WEB_SERVER_PORT"), cfg.WebServerPort)
 		cfg.OpenAIModel = firstNonEmpty(os.Getenv("OPENAI_MODEL"), cfg.OpenAIModel)
 		cfg.GroupmeMessageSuffix = firstNonEmpty(os.Getenv("GROUPME_MESSAGE_SUFFIX"), cfg.GroupmeMessageSuffix)
+		if val := os.Getenv("PROCESSED_RETENTION_HOURS"); val != "" {
+			if parsed, err := strconv.Atoi(val); err == nil {
+				cfg.ProcessedRetentionHours = parsed
+			}
+		}
 	}
 
 	if cfg.UploadDir == "" {
@@ -253,6 +260,28 @@ func getConfig() Config {
 	return config
 }
 
+func processedRetentionDuration() time.Duration {
+	hours := getConfig().ProcessedRetentionHours
+	if hours <= 0 {
+		return 0
+	}
+
+	return time.Duration(hours) * time.Hour
+}
+
+func normalizePath(path string) string {
+	trimmed := strings.TrimSpace(path)
+	if trimmed == "" {
+		return ""
+	}
+
+	if abs, err := filepath.Abs(trimmed); err == nil {
+		return abs
+	}
+
+	return trimmed
+}
+
 func initDatabase(path string) error {
 	dbMux.Lock()
 	if dbConn != nil {
@@ -298,6 +327,16 @@ func initDatabase(path string) error {
 	if _, err := conn.Exec(createTable); err != nil {
 		dbMux.Unlock()
 		return fmt.Errorf("unable to initialize database: %w", err)
+	}
+
+	processedTable := `CREATE TABLE IF NOT EXISTS processed_files (
+                path TEXT PRIMARY KEY,
+                processed_at TEXT
+        )`
+
+	if _, err := conn.Exec(processedTable); err != nil {
+		dbMux.Unlock()
+		return fmt.Errorf("unable to initialize processed files table: %w", err)
 	}
 
 	dbConn = conn
@@ -369,6 +408,137 @@ func loadTranscriptionsFromDB() error {
 	transcriptionsMux.Unlock()
 
 	return nil
+}
+
+func cleanupProcessedFiles(retention time.Duration) {
+	dbMux.RLock()
+	conn := dbConn
+	dbMux.RUnlock()
+
+	if conn == nil {
+		return
+	}
+
+	rows, err := conn.Query(`SELECT path, processed_at FROM processed_files`)
+	if err != nil {
+		log.Printf("Unable to inspect processed files: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	now := time.Now().UTC()
+
+	for rows.Next() {
+		var (
+			path           string
+			processedAtStr string
+		)
+
+		if err := rows.Scan(&path, &processedAtStr); err != nil {
+			log.Printf("Unable to scan processed file row: %v", err)
+			continue
+		}
+
+		remove := false
+
+		if retention > 0 {
+			if processedAt, err := time.Parse(time.RFC3339Nano, processedAtStr); err == nil {
+				if now.Sub(processedAt) > retention {
+					remove = true
+				}
+			}
+		}
+
+		if !remove {
+			if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+				remove = true
+			}
+		}
+
+		if remove {
+			if _, err := conn.Exec(`DELETE FROM processed_files WHERE path = ?`, path); err != nil {
+				log.Printf("Unable to remove processed file entry for %s: %v", path, err)
+			}
+		}
+	}
+}
+
+func isFileProcessed(path string) bool {
+	normalized := normalizePath(path)
+	if normalized == "" {
+		return false
+	}
+
+	dbMux.RLock()
+	conn := dbConn
+	dbMux.RUnlock()
+
+	if conn == nil {
+		return false
+	}
+
+	var processedAtStr string
+	err := conn.QueryRow(`SELECT processed_at FROM processed_files WHERE path = ?`, normalized).Scan(&processedAtStr)
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			log.Printf("Unable to check processed state for %s: %v", normalized, err)
+		}
+		return false
+	}
+
+	retention := processedRetentionDuration()
+	if retention > 0 {
+		if processedAt, err := time.Parse(time.RFC3339Nano, processedAtStr); err == nil {
+			if time.Since(processedAt) > retention {
+				go removeProcessedRecord(normalized)
+				return false
+			}
+		}
+	}
+
+	return true
+}
+
+func recordFileProcessed(path string) {
+	normalized := normalizePath(path)
+	if normalized == "" {
+		return
+	}
+
+	dbMux.RLock()
+	conn := dbConn
+	dbMux.RUnlock()
+
+	if conn == nil {
+		return
+	}
+
+	processedAt := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := conn.Exec(
+		`INSERT INTO processed_files (path, processed_at) VALUES (?, ?) ON CONFLICT(path) DO UPDATE SET processed_at = excluded.processed_at`,
+		normalized, processedAt,
+	); err != nil {
+		log.Printf("Unable to record processed file %s: %v", normalized, err)
+	}
+}
+
+func removeProcessedRecord(path string) {
+	normalized := normalizePath(path)
+	if normalized == "" {
+		return
+	}
+
+	dbMux.RLock()
+	conn := dbConn
+	dbMux.RUnlock()
+
+	if conn == nil {
+		return
+	}
+
+	if _, err := conn.Exec(`DELETE FROM processed_files WHERE path = ?`, normalized); err != nil {
+		log.Printf("Unable to clear processed record for %s: %v", normalized, err)
+	}
 }
 
 func persistTranscription(t Transcription) {
@@ -450,6 +620,9 @@ func watchDirectory(ctx context.Context, dir string, handler func(string)) error
 		return fmt.Errorf("failed to watch directory %s: %w", dir, err)
 	}
 
+	retention := processedRetentionDuration()
+	cleanupProcessedFiles(retention)
+
 	// Process any files that already exist when the watcher starts.
 	if err := filepath.WalkDir(dir, func(path string, d os.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -458,11 +631,18 @@ func watchDirectory(ctx context.Context, dir string, handler func(string)) error
 		if d.IsDir() {
 			return nil
 		}
+		if isFileProcessed(path) {
+			return nil
+		}
+
 		go handler(path)
 		return nil
 	}); err != nil {
 		return fmt.Errorf("failed to walk initial directory state: %w", err)
 	}
+
+	cleanupTicker := time.NewTicker(time.Hour)
+	defer cleanupTicker.Stop()
 
 	for {
 		select {
@@ -475,10 +655,15 @@ func watchDirectory(ctx context.Context, dir string, handler func(string)) error
 			if event.Op&(fsnotify.Create|fsnotify.Write|fsnotify.Rename) != 0 {
 				go handler(event.Name)
 			}
+			if event.Op&fsnotify.Remove != 0 {
+				go removeProcessedRecord(event.Name)
+			}
 		case err := <-watcher.Errors:
 			if err != nil {
 				log.Println("Watcher error:", err)
 			}
+		case <-cleanupTicker.C:
+			go cleanupProcessedFiles(retention)
 		}
 	}
 }
@@ -574,12 +759,9 @@ func handleUploadFile(path string) {
 		return
 	}
 
-	absPath, err := filepath.Abs(path)
-	if err == nil {
-		path = absPath
-	}
+	normalized := normalizePath(path)
 
-	info, err := os.Stat(path)
+	info, err := os.Stat(normalized)
 	if err != nil {
 		return
 	}
@@ -588,39 +770,48 @@ func handleUploadFile(path string) {
 		return
 	}
 
-	processedFilesMux.Lock()
-	if processedFiles[path] {
-		processedFilesMux.Unlock()
+	processingFilesMux.Lock()
+	if processingFiles[normalized] {
+		processingFilesMux.Unlock()
 		return
 	}
-	processedFiles[path] = true
-	processedFilesMux.Unlock()
+	processingFiles[normalized] = true
+	processingFilesMux.Unlock()
+	defer func(p string) {
+		processingFilesMux.Lock()
+		delete(processingFiles, p)
+		processingFilesMux.Unlock()
+	}(normalized)
 
-	if err := waitForStableFile(path, 10, 500*time.Millisecond); err != nil {
-		log.Printf("Skipping unstable file %s: %v", filepath.Base(path), err)
+	if isFileProcessed(normalized) {
 		return
 	}
 
-	silent, err := isAudioSilent(path)
+	if err := waitForStableFile(normalized, 10, 500*time.Millisecond); err != nil {
+		log.Printf("Skipping unstable file %s: %v", filepath.Base(normalized), err)
+		return
+	}
+
+	silent, err := isAudioSilent(normalized)
 	if err != nil {
-		log.Printf("Unable to inspect audio %s: %v", filepath.Base(path), err)
+		log.Printf("Unable to inspect audio %s: %v", filepath.Base(normalized), err)
 		return
 	}
 	if silent {
-		log.Printf("Skipping silent audio file: %s", filepath.Base(path))
+		log.Printf("Skipping silent audio file: %s", filepath.Base(normalized))
 		return
 	}
 
-	transcription, err := transcribeAudio(path)
+	transcription, err := transcribeAudio(normalized)
 	if err != nil {
-		log.Printf("Failed to transcribe %s: %v", filepath.Base(path), err)
+		log.Printf("Failed to transcribe %s: %v", filepath.Base(normalized), err)
 		return
 	}
 
 	metadata := StreamMetadata{
-		RawTags:       map[string]string{"filename": filepath.Base(path)},
-		SelectedTag:   strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)),
-		NormalizedTag: normalizeTransmissionLabel(strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))),
+		RawTags:       map[string]string{"filename": filepath.Base(normalized)},
+		SelectedTag:   strings.TrimSuffix(filepath.Base(normalized), filepath.Ext(normalized)),
+		NormalizedTag: normalizeTransmissionLabel(strings.TrimSuffix(filepath.Base(normalized), filepath.Ext(normalized))),
 		ReceivedAt:    time.Now(),
 	}
 
@@ -632,13 +823,14 @@ func handleUploadFile(path string) {
 		message = strings.TrimSpace(message + " " + messageSuffix)
 	}
 
-	storeTranscription(filepath.Base(path), transcription, corrected, metadata.NormalizedTag, metadata)
+	storeTranscription(filepath.Base(normalized), transcription, corrected, metadata.NormalizedTag, metadata)
+	recordFileProcessed(normalized)
 
 	for _, channel := range cfg.Channels {
 		if channel.SendUploadNotification || cfg.SendUploadNotification {
-			notice := fmt.Sprintf("New audio received: %s", filepath.Base(path))
+			notice := fmt.Sprintf("New audio received: %s", filepath.Base(normalized))
 			if cfg.IncludeAudioLink {
-				notice = fmt.Sprintf("%s (%s)", notice, path)
+				notice = fmt.Sprintf("%s (%s)", notice, normalized)
 			}
 			notice = formatMessageWithMetadata(notice, metadata.NormalizedTag, metadata)
 			dispatchMessage(notice, channel, cfg)
