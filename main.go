@@ -231,7 +231,11 @@ func loadConfig() Config {
 		cfg.GroupmeBotID = os.Getenv("GROUPME_BOT_ID")
 	}
 
-	if len(cfg.Channels) == 0 && cfg.GroupmeBotID != "" {
+	return ensureDefaultChannels(cfg)
+}
+
+func ensureDefaultChannels(cfg Config) Config {
+	if len(cfg.Channels) == 0 && strings.TrimSpace(cfg.GroupmeBotID) != "" {
 		cfg.Channels = []ChannelConfig{
 			{
 				Name:                   "default",
@@ -587,6 +591,10 @@ func startFTPServer(cfg Config) error {
 }
 
 func handleUploadFile(path string) {
+	processUploadedFile(path, "")
+}
+
+func processUploadedFile(path string, filterOverride string) {
 	if strings.TrimSpace(path) == "" {
 		return
 	}
@@ -638,7 +646,8 @@ func handleUploadFile(path string) {
 		return
 	}
 
-	transcription, err := transcribeAudio(path)
+	filterChain := resolveNoiseFilterWithOverride(getConfig(), filterOverride)
+	transcription, err := transcribeAudio(path, filterChain)
 	if err != nil {
 		log.Printf("Failed to transcribe %s: %v", filepath.Base(path), err)
 		return
@@ -814,14 +823,14 @@ func isAudioSilent(filePath string) (bool, error) {
 	return maxVolume <= -55.0, nil
 }
 
-func transcribeAudio(filePath string) (string, error) {
+func transcribeAudio(filePath, filterChain string) (string, error) {
 	cfg := getConfig()
 
 	if cfg.OpenAIAPIKey == "" {
 		return "", fmt.Errorf("missing OpenAI API key")
 	}
 
-	filteredFilePath, err := preprocessAudio(filePath)
+	filteredFilePath, err := preprocessAudio(filePath, filterChain)
 	if err != nil {
 		return "", fmt.Errorf("audio preprocessing failed: %w", err)
 	}
@@ -983,11 +992,10 @@ func humanizeTranscription(text string, metadata StreamMetadata, cfg Config) (st
 	return strings.TrimSpace(completion.Choices[0].Message.Content), nil
 }
 
-func preprocessAudio(inputFilePath string) (string, error) {
+func preprocessAudio(inputFilePath, filterChain string) (string, error) {
 	tempDir := os.TempDir()
 	outputFilePath := filepath.Join(tempDir, filepath.Base(inputFilePath)+".filtered.mp3")
 
-	filterChain := resolveNoiseFilter(getConfig())
 	log.Printf("Applying noise filter chain '%s' for %s", filterChain, filepath.Base(inputFilePath))
 	cmd := exec.Command("ffmpeg", "-y", "-i", inputFilePath, "-af", filterChain, outputFilePath)
 	output, err := cmd.CombinedOutput()
@@ -1012,6 +1020,21 @@ func resolveNoiseFilter(cfg Config) string {
 	}
 
 	return selected
+}
+
+func resolveNoiseFilterWithOverride(cfg Config, override string) string {
+	trimmed := strings.TrimSpace(override)
+	if trimmed != "" {
+		if strings.EqualFold(trimmed, "raw") || strings.EqualFold(trimmed, "none") || strings.EqualFold(trimmed, "original") {
+			return "anull"
+		}
+		if chain, ok := defaultNoiseFilters[strings.ToLower(trimmed)]; ok {
+			return chain
+		}
+		return trimmed
+	}
+
+	return resolveNoiseFilter(cfg)
 }
 
 func waitForStableFile(path string, attempts int, delay time.Duration) error {
@@ -1255,6 +1278,9 @@ func startWebServer(port string) {
 	http.HandleFunc("/", transcriptionsHandler)
 	http.HandleFunc("/transcriptions", transcriptionsHandler)
 	http.HandleFunc("/api/config", configAPIHandler)
+	http.HandleFunc("/api/reload", reloadConfigHandler)
+	http.HandleFunc("/api/upload", uploadHandler)
+	http.HandleFunc("/api/audio-preview", audioPreviewHandler)
 
 	log.Printf("Starting web server on port %s...", port)
 	if err := http.ListenAndServe(":"+port, nil); err != nil {
@@ -1340,6 +1366,140 @@ func configAPIHandler(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+func reloadConfigHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	cfg := loadConfig()
+	if err := validateConfig(cfg); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	setConfig(cfg)
+
+	if err := os.MkdirAll(cfg.UploadDir, 0o755); err != nil {
+		http.Error(w, "Failed to prepare upload directory", http.StatusInternalServerError)
+		return
+	}
+	if err := initDatabase(cfg.DatabasePath); err != nil {
+		http.Error(w, "Failed to reinitialize database", http.StatusInternalServerError)
+		return
+	}
+	if err := startUploadWatcher(cfg.UploadDir); err != nil {
+		http.Error(w, "Failed to restart upload watcher", http.StatusInternalServerError)
+		return
+	}
+	if err := startFTPServer(cfg); err != nil {
+		http.Error(w, "Failed to restart FTP server", http.StatusInternalServerError)
+		return
+	}
+
+	respondWithJSON(w, cfg)
+}
+
+func uploadHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	cfg := getConfig()
+	if err := r.ParseMultipartForm(50 << 20); err != nil {
+		http.Error(w, "Failed to parse upload form", http.StatusBadRequest)
+		return
+	}
+
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		http.Error(w, "Audio file is required", http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+
+	cleanedName := sanitizeFileName(header.Filename)
+	if cleanedName == "" {
+		http.Error(w, "Invalid filename", http.StatusBadRequest)
+		return
+	}
+
+	if err := os.MkdirAll(cfg.UploadDir, 0o755); err != nil {
+		http.Error(w, "Unable to prepare upload directory", http.StatusInternalServerError)
+		return
+	}
+
+	ext := strings.ToLower(filepath.Ext(cleanedName))
+	if !allowedAudioExtensions[ext] {
+		http.Error(w, "Unsupported audio format", http.StatusBadRequest)
+		return
+	}
+
+	timestamped := fmt.Sprintf("%d_%s", time.Now().UnixNano(), cleanedName)
+	destPath := filepath.Join(cfg.UploadDir, timestamped)
+	destFile, err := os.Create(destPath)
+	if err != nil {
+		http.Error(w, "Failed to store upload", http.StatusInternalServerError)
+		return
+	}
+
+	if _, err := io.Copy(destFile, file); err != nil {
+		_ = destFile.Close()
+		http.Error(w, "Failed to save upload", http.StatusInternalServerError)
+		return
+	}
+	_ = destFile.Close()
+
+	filterOverride := r.FormValue("noiseFilter")
+	go processUploadedFile(destPath, filterOverride)
+
+	respondWithJSON(w, map[string]string{
+		"fileName":    timestamped,
+		"status":      "uploaded",
+		"noiseFilter": strings.TrimSpace(filterOverride),
+	})
+}
+
+func audioPreviewHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	cfg := getConfig()
+	requested := sanitizeFileName(r.URL.Query().Get("file"))
+	if requested == "" {
+		http.Error(w, "File parameter is required", http.StatusBadRequest)
+		return
+	}
+
+	fullPath := filepath.Join(cfg.UploadDir, requested)
+	info, err := os.Stat(fullPath)
+	if err != nil || info.IsDir() {
+		http.Error(w, "File not found", http.StatusNotFound)
+		return
+	}
+
+	filterParam := strings.TrimSpace(r.URL.Query().Get("filter"))
+	if filterParam == "" || strings.EqualFold(filterParam, "raw") || strings.EqualFold(filterParam, "original") {
+		w.Header().Set("Content-Type", "audio/mpeg")
+		http.ServeFile(w, r, fullPath)
+		return
+	}
+
+	filterChain := resolveNoiseFilterWithOverride(cfg, filterParam)
+	previewPath, err := preprocessAudio(fullPath, filterChain)
+	if err != nil {
+		http.Error(w, "Unable to build preview", http.StatusInternalServerError)
+		return
+	}
+	defer os.Remove(previewPath)
+
+	w.Header().Set("Content-Type", "audio/mpeg")
+	http.ServeFile(w, r, previewPath)
 }
 
 func respondWithJSON(w http.ResponseWriter, payload interface{}) {
@@ -1466,7 +1626,7 @@ func mergeConfig(current, incoming Config) Config {
 		current.FTPPort = "2121"
 	}
 
-	return current
+	return ensureDefaultChannels(current)
 }
 
 func validateConfig(cfg Config) error {
@@ -1491,6 +1651,12 @@ func validateConfig(cfg Config) error {
 	}
 
 	return nil
+}
+
+func sanitizeFileName(name string) string {
+	base := filepath.Base(strings.TrimSpace(name))
+	cleaned := regexp.MustCompile(`[^a-zA-Z0-9._-]+`).ReplaceAllString(base, "_")
+	return strings.Trim(cleaned, "._-")
 }
 
 func firstNonEmpty(values ...string) string {
