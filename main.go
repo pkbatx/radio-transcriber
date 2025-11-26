@@ -111,6 +111,15 @@ var (
 	dbMux               sync.RWMutex
 )
 
+var allowedAudioExtensions = map[string]bool{
+	".mp3":  true,
+	".wav":  true,
+	".m4a":  true,
+	".aac":  true,
+	".flac": true,
+	".ogg":  true,
+}
+
 var defaultNoiseFilters = map[string]string{
 	"narrowband":         "highpass=f=300, lowpass=f=3400",
 	"hiss_reduction":     "highpass=f=280, lowpass=f=3200, afftdn=nf=-25",
@@ -596,6 +605,16 @@ func handleUploadFile(path string) {
 		return
 	}
 
+	allowed, err := isAllowedAudioFile(path)
+	if err != nil {
+		log.Printf("Unable to verify file type for %s: %v", filepath.Base(path), err)
+		return
+	}
+	if !allowed {
+		log.Printf("Skipping unsupported file type: %s", filepath.Base(path))
+		return
+	}
+
 	processedFilesMux.Lock()
 	if processedFiles[path] {
 		processedFilesMux.Unlock()
@@ -687,6 +706,28 @@ func handleUploadFile(path string) {
 			dispatchMessage(channelMessage, channel, cfg)
 		}
 	}
+}
+
+func isAllowedAudioFile(path string) (bool, error) {
+	ext := strings.ToLower(filepath.Ext(path))
+	if ext != "" {
+		return allowedAudioExtensions[ext], nil
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		return false, fmt.Errorf("opening file for MIME sniffing: %w", err)
+	}
+	defer file.Close()
+
+	buffer := make([]byte, 512)
+	n, err := file.Read(buffer)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return false, fmt.Errorf("reading file for MIME sniffing: %w", err)
+	}
+
+	mimeType := http.DetectContentType(buffer[:n])
+	return strings.HasPrefix(mimeType, "audio/"), nil
 }
 
 func buildStreamRecorderArgs(streamURL, outputPattern string, segmentSeconds int) []string {
