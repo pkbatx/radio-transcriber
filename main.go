@@ -1450,6 +1450,9 @@ func mergeConfig(current, incoming Config) Config {
 	}
 	if incoming.PreferredNoiseFilter != "" {
 		current.PreferredNoiseFilter = incoming.PreferredNoiseFilter
+	} else {
+		// Allow users to reset the preference back to automatic/empty.
+		current.PreferredNoiseFilter = ""
 	}
 	current.FTPEnabled = incoming.FTPEnabled
 	if incoming.FTPPort != "" {
